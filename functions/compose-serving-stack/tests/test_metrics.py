@@ -31,7 +31,7 @@ import json
 import pathlib
 
 import pytest
-from function import stacks
+from function import collector, stacks
 from models.ai.modelplane.metricmapping import v1alpha1 as mmv1alpha1
 
 
@@ -186,3 +186,44 @@ def test_histogram_layouts() -> None:
                 layouts[m.to].add(buckets[m.from_])
     assert {to: sorted(s) for to, s in sources.items() if len(s) > 1} == {}, "a histogram takes more than one source"
     assert sorted(to for to, ls in layouts.items() if len(ls) > 1) == [], "a histogram's buckets differ by version"
+
+
+@dataclasses.dataclass
+class GatewayLabelsCase:
+    """One Envoy AI Gateway source, and why its series must name the model."""
+
+    name: str
+    reason: str
+    source: str
+
+
+GATEWAY_LABELS_CASES = [
+    GatewayLabelsCase(
+        name="request-duration",
+        reason="end-to-end latency has to break down by the model the client asked for and the one served",
+        source="gen_ai_server_request_duration_seconds",
+    ),
+    GatewayLabelsCase(
+        name="time-to-first-token",
+        reason="TTFT through the gateway has to break down by model like the engine's own TTFT does",
+        source="gen_ai_server_time_to_first_token_seconds",
+    ),
+    GatewayLabelsCase(
+        name="time-per-output-token",
+        reason="inter-token latency through the gateway has to break down by model",
+        source="gen_ai_server_time_per_output_token_seconds",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", GATEWAY_LABELS_CASES, ids=lambda case: case.name)
+def test_gateway_series_carry_service_and_served_model(case: GatewayLabelsCase) -> None:
+    """Each gateway series carries the requested model as service and the routed model as served_model."""
+    _, _, datapoint, _ = collector.statements(stacks.BUILTIN_MAPPINGS)
+    where = f'where metric.name == "{case.source}"'
+    assert [s for s in datapoint if s.endswith(where)] == [
+        f'set(datapoint.attributes["service"], datapoint.attributes["gen_ai_original_model"]) {where}',
+        f'delete_key(datapoint.attributes, "gen_ai_original_model") {where}',
+        f'set(datapoint.attributes["served_model"], datapoint.attributes["gen_ai_request_model"]) {where}',
+        f'delete_key(datapoint.attributes, "gen_ai_request_model") {where}',
+    ], case.reason
