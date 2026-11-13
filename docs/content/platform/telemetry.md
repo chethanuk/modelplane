@@ -30,15 +30,17 @@ A series about a deployment also has `deployment`, `replica`, `namespace`,
 `engine`, and `role` labels. On a prefill/decode deployment, an engine's series also
 has a `phase` label, `Prefill` or `Decode`.
 
-The gateway's `modelplane_frontend_*` series have no `deployment` label. They
-carry the model instead: `gen_ai_original_model` is the model the caller sent,
-`<namespace>/<service>`, and `gen_ai_request_model` is the deployment the gateway
-sent the request to, `<namespace>/<deployment>`.
-`modelplane_frontend_requests_active` is counted per `ModelService` instead. It
-has a `service` label, and the same `namespace` label as an engine's series:
-the team's namespace as it's mirrored on the inference cluster, such as
-`mp-ml-team-51733`. The namespace in `gen_ai_original_model` is the team's own,
-such as `ml-team`, so the two don't join on it.
+The gateway's latency series, `modelplane_frontend_request_duration_seconds`,
+`modelplane_frontend_ttft_seconds`, and `modelplane_frontend_tpot_seconds`, have
+no `deployment` label. They carry the model instead: `service` is the model the
+caller sent, `<namespace>/<service>`, and `served_model` is the deployment the
+gateway sent the request to, `<namespace>/<deployment>`. For an external
+endpoint, `served_model` is the provider's model name.
+`modelplane_frontend_requests_active` is counted per `ModelService` instead. Its
+`service` label is the service's name alone, and it has the same `namespace`
+label as an engine's series: the team's namespace as it's mirrored on the
+inference cluster, such as `mp-ml-team-51733`. The namespace in the latency
+series' `service` is the team's own, such as `ml-team`, so the two don't join on it.
 
 Each replica publishes its own series, so combine them in your query. Which
 combination is right follows from what the metric measures:
@@ -274,7 +276,15 @@ fleet-wide p99 of time to first token, which requires streaming traffic:
 
 ```promql
 histogram_quantile(0.99, sum by (le) (
-  rate(modelplane_frontend_ttft_seconds_bucket{gen_ai_request_model="ml-team/qwen3-8b"}[5m])))
+  rate(modelplane_frontend_ttft_seconds_bucket{served_model="ml-team/qwen3-8b"}[5m])))
+```
+
+Each deployment's share of a service's traffic, such as during a canary:
+
+```promql
+sum by (served_model) (rate(modelplane_frontend_request_duration_seconds_count{service="ml-team/assistant"}[5m]))
+  / ignoring (served_model) group_left
+sum (rate(modelplane_frontend_request_duration_seconds_count{service="ml-team/assistant"}[5m]))
 ```
 
 Modelplane has no dashboards of its own. What it exports is counters and histogram buckets, and
