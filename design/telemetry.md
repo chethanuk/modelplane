@@ -640,7 +640,8 @@ separate those from a slow model.
 | `modelplane_sglang_ttft_seconds` | histogram | engine, SGLang only |
 | `modelplane_tool_call_parses_total{outcome}` | counter | engine, where reported |
 | `modelplane_route_decision_seconds` | histogram | picker |
-| `modelplane_route_requests_total{decision}` | counter | picker |
+| `modelplane_route_requests_total` | counter | picker |
+| `modelplane_route_request_errors_total{reason}` | counter | picker |
 | `modelplane_route_pd_pairings_total{status}` | counter | picker, disaggregated only |
 
 **What it costs.**

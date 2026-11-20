@@ -117,6 +117,7 @@ _SGLANG_TOKENS = ("sglang:prompt_tokens_histogram", "sglang:generation_tokens_hi
 # engine's, so it keeps a name of its own.
 _PICKER = {
     "llm_d_epp_scheduler_e2e_duration_seconds": "modelplane_route_decision_seconds",
+    "llm_d_epp_request_total": "modelplane_route_requests_total",
 }
 
 # The GPUs, through whichever vendor's exporter the stack installed. DCGM
@@ -211,6 +212,21 @@ _SGLANG_RESPONSES: dict[str, object] = {
 }
 
 
+# The requests the endpoint picker failed, by llm-d's error code renamed to
+# reason, such as ModelServerError for an engine response other than 200,
+# ResourceExhausted for a request rejected as saturated or with no endpoint,
+# and ServiceUnavailable for one that timed out in the queue. The gateway
+# reports every failure as _OTHER, so this and modelplane_route_requests_total
+# are the per-deployment outcome for any engine. The picker counts a request
+# only once it has routed it, so one rejected before that is an error and not
+# a request.
+_PICKER_ERRORS: dict[str, object] = {
+    "from": "llm_d_epp_request_error_total",
+    "to": "modelplane_route_request_errors_total",
+    "labels": [{"name": "reason", "from": "error_code"}],
+}
+
+
 def _tokens(prompt: str, generation: str) -> list[dict[str, object]]:
     """An engine's token histograms as tokens by direction, and requests."""
     return [
@@ -267,7 +283,7 @@ def mappings() -> list[v1alpha1.MetricMapping]:
         _mapping("modelplane-gateway-proxy", _GATEWAY_PROXY),
         _mapping("modelplane-vllm", _VLLM, tokens=_VLLM_TOKENS, extra=(_VLLM_RESPONSES,)),
         _mapping("modelplane-sglang", _SGLANG, tokens=_SGLANG_TOKENS, extra=(_SGLANG_RESPONSES,)),
-        _mapping("modelplane-picker", _PICKER),
+        _mapping("modelplane-picker", _PICKER, extra=(_PICKER_ERRORS,)),
         _mapping("modelplane-gpu", _GPU, _GPU_UNITS),
         _mapping("modelplane-gpu-amd", _AMD_GPU, _AMD_GPU_UNITS, types=_AMD_GPU_TYPES),
     ]
