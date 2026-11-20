@@ -359,6 +359,22 @@ counts its `/health` and `/metrics` responses too, so filter on it. The requests
 SGLang has open, `sglang:http_requests_active`, become `modelplane_engine_requests_active`,
 with the same `endpoint` label. The vLLM mapping populates neither.
 
+The gateway reports every failed request with `error_type` `_OTHER`, so it can't
+tell a request the engine failed from one that never reached an engine. The
+endpoint picker can, whichever engine serves the deployment. Its
+`llm_d_epp_request_total` becomes `modelplane_route_requests_total`, and
+`llm_d_epp_request_error_total` becomes `modelplane_route_request_errors_total`,
+with the picker's error code renamed to `reason`. For example, `ModelServerError`
+is a response from the engine with a status other than 200, `ResourceExhausted` is
+a request the picker rejected as saturated or had no endpoint for, and
+`ServiceUnavailable` is one that timed out in the picker's queue or whose client
+went away. The picker counts a request only once it has routed it, so a request it
+rejected before that is an error but not a request:
+
+```promql
+sum by (deployment, reason) (rate(modelplane_route_request_errors_total[5m]))
+```
+
 The built-in mappings cover what every deployment needs, from the engine versions
 the recipes pin, which is what they're tested against: vLLM v0.9.2, v0.23.0, v0.25.1
 and v0.27.1, and SGLang v0.5.10 and v0.5.12. Metrics for a feature you turn on, such
