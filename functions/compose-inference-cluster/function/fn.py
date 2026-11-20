@@ -50,6 +50,7 @@ from models.ai.modelplane.infrastructure.ekscluster import v1alpha1 as eksv1alph
 from models.ai.modelplane.infrastructure.gkecluster import v1alpha1 as gkev1alpha1
 from models.ai.modelplane.infrastructure.nebiuscluster import v1alpha1 as nebiusv1alpha1
 from models.ai.modelplane.infrastructure.servingstack import v1alpha1 as ssv1alpha1
+from models.ai.modelplane.infrastructure.upcloudcluster import v1alpha1 as upcloudv1alpha1
 from models.ai.modelplane.infrastructure.vultrcluster import v1alpha1 as vultrv1alpha1
 from models.ai.modelplane.modelcache import v1alpha1 as mcv1alpha1
 from models.io.crossplane.apiextensions.managedresourceactivationpolicy import (
@@ -66,7 +67,7 @@ from models.io.k8s.apimachinery.pkg.apis.meta import v1 as metav1
 # Cluster source discriminator values from the XRD enum. The Literal
 # mirrors ServingStack spec.cloud, so passing a wrong or unsupported
 # cloud fails type checking; Final makes each constant a literal type.
-Cloud = Literal["GKE", "EKS", "AKS", "Nebius", "Vultr", "Civo", "CoreWeave", "Existing"]
+Cloud = Literal["GKE", "EKS", "AKS", "Nebius", "Vultr", "Civo", "CoreWeave", "UpCloud", "Existing"]
 CLUSTER_SOURCE_GKE: Final = "GKE"
 CLUSTER_SOURCE_EKS: Final = "EKS"
 CLUSTER_SOURCE_AKS: Final = "AKS"
@@ -74,21 +75,42 @@ CLUSTER_SOURCE_NEBIUS: Final = "Nebius"
 CLUSTER_SOURCE_VULTR: Final = "Vultr"
 CLUSTER_SOURCE_CIVO: Final = "Civo"
 CLUSTER_SOURCE_COREWEAVE: Final = "CoreWeave"
+CLUSTER_SOURCE_UPCLOUD: Final = "UpCloud"
 CLUSTER_SOURCE_EXISTING: Final = "Existing"
 
-# Condition types and reasons for the InferenceCluster XR.
-CONDITION_TYPE_CLUSTER_READY = "ClusterReady"
-CONDITION_TYPE_BACKEND_READY = "BackendReady"
+# Composed resource key of the cloud cluster XR for each source Modelplane provisions.
+_CLUSTER_RESOURCE_KEYS: Final[dict[str, str]] = {
+    CLUSTER_SOURCE_GKE: "gke-cluster",
+    CLUSTER_SOURCE_EKS: "eks-cluster",
+    CLUSTER_SOURCE_AKS: "aks-cluster",
+    CLUSTER_SOURCE_NEBIUS: "nebius-cluster",
+    CLUSTER_SOURCE_VULTR: "vultr-cluster",
+    CLUSTER_SOURCE_CIVO: "civo-cluster",
+    CLUSTER_SOURCE_COREWEAVE: "coreweave-cluster",
+    CLUSTER_SOURCE_UPCLOUD: "upcloud-cluster",
+}
 
-CONDITION_REASON_CLUSTER_RUNNING = "ClusterRunning"
+# Conditions reporting which provisioning stage the cluster is in: Accepted,
+# then ClusterReady and NodePoolsReady, relayed from the cloud cluster XR, then
+# ServingStackReady. A stage is Pending on an earlier one only until it's
+# composed. After that it reports its own state, so a running cluster's
+# ServingStackReady stays True while a new node pool provisions.
+CONDITION_TYPE_ACCEPTED = "Accepted"
+CONDITION_TYPE_CLUSTER_READY = "ClusterReady"
+CONDITION_TYPE_NODE_POOLS_READY = "NodePoolsReady"
+CONDITION_TYPE_SERVING_STACK_READY = "ServingStackReady"
+
+CONDITION_REASON_AVAILABLE = "Available"
+CONDITION_REASON_PENDING = "Pending"
 CONDITION_REASON_PROVISIONING = "Provisioning"
-CONDITION_REASON_WAITING_FOR_CLUSTER = "WaitingForCluster"
+CONDITION_REASON_EXISTING = "Existing"
 CONDITION_REASON_WAITING_FOR_CLASSES = "WaitingForClasses"
 CONDITION_REASON_WAITING_FOR_RESERVATIONS = "WaitingForReservations"
-CONDITION_REASON_BACKEND_HEALTHY = "BackendHealthy"
-CONDITION_REASON_INSTALLING = "Installing"
 CONDITION_REASON_INVALID_NODE_POOL = "InvalidNodePool"
 CONDITION_REASON_UNSUPPORTED_DEVICES = "UnsupportedDevices"
+
+# status.nodePools[].state of a pool the cloud cluster XR doesn't report.
+_POOL_STATE_PENDING = "Pending"
 
 # The DRA drivers each cloud supports. A hand-kept mirror of
 # supported_drivers() in compose-serving-stack's stacks package -
@@ -107,6 +129,7 @@ _SUPPORTED_DRA_DRIVERS: dict[Cloud, frozenset[str]] = {
     CLUSTER_SOURCE_VULTR: frozenset({"gpu.nvidia.com", "dra.cpu"}),
     CLUSTER_SOURCE_CIVO: frozenset({"gpu.nvidia.com", "dra.cpu"}),
     CLUSTER_SOURCE_COREWEAVE: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+    CLUSTER_SOURCE_UPCLOUD: frozenset({"gpu.nvidia.com", "dra.cpu"}),
 }
 
 # InferenceClass device claim values. An unset claim means DRA.
@@ -114,6 +137,9 @@ _CLAIM_DRA = "DRA"
 
 # Composed resource key for the backend XR.
 BACKEND_RESOURCE_KEY = "serving-stack"
+
+# Composed resource key for the ClusterProviderConfig that reaches the cluster.
+CLUSTER_PROVIDER_CONFIG_RESOURCE_KEY = "cluster-provider-config-kubernetes"
 
 # Composed resource key for the ClusterUsage that blocks the InferenceCluster's
 # deletion while anything composes objects onto it.
@@ -250,6 +276,11 @@ _ACTIVATE_COREWEAVE = (
     "clusters.cks.coreweave.m.upbound.io",
     "vpcs.networking.coreweave.m.upbound.io",
 )
+_ACTIVATE_UPCLOUD = (
+    "kubernetesclusters.uks.m.upcloud.com",
+    "kubernetesnodegroups.uks.m.upcloud.com",
+    "networks.network.m.upcloud.com",
+)
 
 
 def _name(meta: metav1.ObjectMeta | None) -> str:
@@ -264,6 +295,26 @@ def _namespace(meta: metav1.ObjectMeta | None) -> str:
     if meta is None or meta.namespace is None:
         raise ValueError("metadata.namespace is unexpectedly absent")
     return meta.namespace
+
+
+def _pending(typ: str, *, after: str) -> resource.Condition:
+    """Condition typ False and Pending, waiting on the earlier stage after."""
+    return resource.Condition(typ=typ, status="False", reason=CONDITION_REASON_PENDING, message=f"Waiting for {after}")
+
+
+def _relay(observed: fnv1.Resource | None, typ: str, *, after: resource.Condition) -> resource.Condition:
+    """The cloud cluster XR's condition of type typ, including an Unknown one
+    Crossplane sets when the cloud cluster XR's function fails.
+
+    A condition the cloud cluster XR doesn't report yet is Pending while the
+    stage before it, after, isn't True, and Provisioning once it is.
+    """
+    c = resource.get_condition(observed, typ)
+    if c.reason is not None:
+        return resource.Condition(typ=typ, status=c.status, reason=c.reason, message=c.message)
+    if after.status != "True":
+        return _pending(typ, after=after.typ)
+    return resource.Condition(typ=typ, status="False", reason=CONDITION_REASON_PROVISIONING)
 
 
 def _gateway_hostname(cluster_name: str) -> str:
@@ -325,7 +376,7 @@ class Composer:
         # Client CA per InferenceGateway, keyed by gateway name.
         self.gateway_cas: dict[str, str] = {}
 
-    def compose(self) -> None:
+    def compose(self) -> None:  # noqa: PLR0912 - one branch per cluster source
         # Crossplane discards a function's desired resources on any reconcile
         # that still has unfulfilled required resources, and re-invokes it once
         # they resolve. So every resource this function reads is required here,
@@ -372,6 +423,8 @@ class Composer:
             self.compose_civo(cluster.civo)
         elif source == CLUSTER_SOURCE_COREWEAVE:
             self.compose_coreweave(cluster.coreweave)
+        elif source == CLUSTER_SOURCE_UPCLOUD:
+            self.compose_upcloud(cluster.upcloud)
         elif source == CLUSTER_SOURCE_EXISTING:
             self.compose_existing(cluster.existing)
         else:
@@ -830,17 +883,23 @@ class Composer:
         return False
 
     def fail(self, reason: str, msg: str) -> None:
-        """Stop composing the cluster, reporting why on its ClusterReady condition.
+        """Stop composing the cluster, reporting why on its Accepted condition.
 
         The result is fatal, so Crossplane applies none of this reconcile's
         desired state. Its caller returns before composing the cluster XR, and
         Crossplane would otherwise delete an existing cluster XR that's missing
         from desired state, for example because someone deleted an
         InferenceClass or edited a node pool.
+
+        Stages that are already composed keep reporting their own state, so a
+        running cluster's ServingStackReady stays True while Accepted is False.
         """
+        accepted = resource.Condition(typ=CONDITION_TYPE_ACCEPTED, status="False", reason=reason, message=msg)
+        source = self.xr.spec.cluster.source if self.xr.spec.cluster else CLUSTER_SOURCE_EXISTING
         response.set_conditions(
             self.rsp,
-            resource.Condition(typ=CONDITION_TYPE_CLUSTER_READY, status="False", reason=reason, message=msg),
+            accepted,
+            *self.stage_conditions(accepted, cluster=_CLUSTER_RESOURCE_KEYS.get(source)),
         )
         response.fatal(self.rsp, msg)
 
@@ -863,7 +922,7 @@ class Composer:
         sa_key = self.observed_gke_secret(_IDENTITY_TYPE_GCP)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if gke_ready and kubeconfig_secret:
+        if kubeconfig_secret and self.keep_cluster_provider_config(cluster_ready=gke_ready):
             self.compose_cluster_provider_config(
                 kubeconfig_secret.name,
                 kubeconfig_secret.key,
@@ -882,8 +941,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "GKE cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=gke_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("gke-cluster"))
+        self.derive_conditions(cluster="gke-cluster")
 
     def compose_eks(self, eks: v1alpha1.Eks | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -910,7 +969,7 @@ class Composer:
         kubeconfig = self.observed_eks_secret(_SECRET_TYPE_KUBECONFIG)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if eks_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=eks_ready):
             self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
 
         backend_secrets = self.resolve_eks_backend_secrets(eks_ready=eks_ready, backend_exists=backend_exists)
@@ -924,8 +983,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "EKS cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=eks_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("eks-cluster"))
+        self.derive_conditions(cluster="eks-cluster")
 
     def compose_aks(self, aks: v1alpha1.Aks | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -950,7 +1009,7 @@ class Composer:
         kubeconfig = self.observed_aks_secret(_SECRET_TYPE_KUBECONFIG)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if aks_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=aks_ready):
             self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
 
         backend_secrets = self.resolve_aks_backend_secrets(aks_ready=aks_ready, backend_exists=backend_exists)
@@ -964,8 +1023,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "AKS cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=aks_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("aks-cluster"))
+        self.derive_conditions(cluster="aks-cluster")
 
     def compose_nebius(self, nebius: v1alpha1.Nebius | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -995,7 +1054,7 @@ class Composer:
         credentials = self.observed_nebius_secret(_IDENTITY_TYPE_NEBIUS)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if nebius_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=nebius_ready):
             self.compose_cluster_provider_config(
                 kubeconfig.name,
                 kubeconfig.key,
@@ -1014,8 +1073,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Nebius cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=nebius_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("nebius-cluster"))
+        self.derive_conditions(cluster="nebius-cluster")
 
     def compose_vultr(self, vultr: v1alpha1.Vultr | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -1040,7 +1099,7 @@ class Composer:
         kubeconfig = self.observed_vultr_secret(_SECRET_TYPE_KUBECONFIG)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if vultr_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=vultr_ready):
             self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
 
         backend_secrets = self.resolve_vultr_backend_secrets(vultr_ready=vultr_ready, backend_exists=backend_exists)
@@ -1054,8 +1113,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Vultr cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=vultr_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("vultr-cluster"))
+        self.derive_conditions(cluster="vultr-cluster")
 
     def compose_civo(self, civo: v1alpha1.Civo | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -1080,7 +1139,7 @@ class Composer:
         kubeconfig = self.observed_civo_secret(_SECRET_TYPE_KUBECONFIG)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if civo_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=civo_ready):
             self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
 
         backend_secrets = self.resolve_civo_backend_secrets(civo_ready=civo_ready, backend_exists=backend_exists)
@@ -1100,8 +1159,8 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Civo cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=civo_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("civo-cluster"))
+        self.derive_conditions(cluster="civo-cluster")
 
     def compose_coreweave(self, coreweave: v1alpha1.Coreweave | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
@@ -1125,7 +1184,7 @@ class Composer:
         kubeconfig = self.observed_coreweave_secret(_SECRET_TYPE_KUBECONFIG)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
-        if coreweave_ready and kubeconfig:
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=coreweave_ready):
             self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
 
         backend_secrets = self.resolve_coreweave_backend_secrets(
@@ -1141,8 +1200,52 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "CoreWeave cluster ready, composing backend")
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=coreweave_ready)
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("coreweave-cluster"))
+        self.derive_conditions(cluster="coreweave-cluster")
+
+    def compose_upcloud(self, upcloud: v1alpha1.Upcloud | None) -> None:
+        """Compose an InferenceCluster backed by a Modelplane-provisioned
+        UKS cluster. Composes the UpCloudCluster XR, waits for it to be
+        ready, then wires its kubeconfig into the backend.
+
+        The UKS kubeconfig embeds static client certificates, so the
+        kubeconfig alone is enough to reach the cluster and no identity is
+        layered on the ClusterProviderConfig.
+        """
+        if not upcloud:
+            response.warning(self.rsp, "UpCloud configuration is required when source is UpCloud")
+            return
+
+        self.compose_activation(_ACTIVATE_UPCLOUD)
+        if self._activation_ready(_ACTIVATE_UPCLOUD) or "upcloud-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            if not self.compose_upcloud_cluster(upcloud):
+                return
+
+        upcloud_ready = (
+            resource.get_condition(self.req.observed.resources.get("upcloud-cluster"), "Ready").status == "True"
+        )
+        kubeconfig = self.observed_upcloud_secret(_SECRET_TYPE_KUBECONFIG)
+        backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
+
+        if kubeconfig and self.keep_cluster_provider_config(cluster_ready=upcloud_ready):
+            self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
+
+        backend_secrets = self.resolve_upcloud_backend_secrets(
+            upcloud_ready=upcloud_ready, backend_exists=backend_exists
+        )
+        if backend_secrets or backend_exists:
+            if backend_secrets:
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_UPCLOUD)
+            self.compose_upcloud_usage()
+
+        if upcloud_ready:
+            self.rsp.desired.resources["upcloud-cluster"].ready = fnv1.READY_TRUE
+            if not backend_exists:
+                response.normal(self.rsp, "UpCloud cluster ready, composing backend")
+
+        self.write_status(self.schedulable_pools(), self.relayed_node_pools("upcloud-cluster"))
+        self.derive_conditions(cluster="upcloud-cluster")
 
     def compose_existing(self, existing: v1alpha1.Existing | None) -> None:
         """Compose an InferenceCluster backed by a user-supplied cluster.
@@ -1170,8 +1273,8 @@ class Composer:
             )
         self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_EXISTING)
 
-        self.write_status(self.schedulable_pools())
-        self.derive_conditions(cluster_ready=True)
+        self.write_status(self.schedulable_pools(), None)
+        self.derive_conditions(cluster=None)
 
     def compose_serving_stack(
         self,
@@ -1221,6 +1324,18 @@ class Composer:
             ),
         )
 
+    def keep_cluster_provider_config(self, *, cluster_ready: bool) -> bool:
+        """Whether to compose the ClusterProviderConfig reaching a provisioned cluster.
+
+        It's first composed once the cloud cluster XR is Ready, then kept while
+        it's observed. The cloud cluster XR goes unready whenever any resource it
+        composes does, and every Object on the cluster - its namespaces,
+        PoolObservations, and every ModelReplica's and ModelRoute's - reaches it
+        through this ProviderConfig, so dropping it then would have Crossplane
+        delete a ProviderConfig they all still use.
+        """
+        return cluster_ready or CLUSTER_PROVIDER_CONFIG_RESOURCE_KEY in self.req.observed.resources
+
     def compose_cluster_provider_config(
         self,
         kubeconfig_name: str,
@@ -1263,13 +1378,17 @@ class Composer:
                 ),
             )
         resource.update(
-            self.rsp.desired.resources["cluster-provider-config-kubernetes"],
+            self.rsp.desired.resources[CLUSTER_PROVIDER_CONFIG_RESOURCE_KEY],
             cpc,
         )
-        self.rsp.desired.resources["cluster-provider-config-kubernetes"].ready = fnv1.READY_TRUE
+        self.rsp.desired.resources[CLUSTER_PROVIDER_CONFIG_RESOURCE_KEY].ready = fnv1.READY_TRUE
 
-    def write_status(self, schedulable_pools: list[v1alpha1.SchedulablePool]) -> None:
-        """Write the InferenceCluster status."""
+    def write_status(
+        self,
+        schedulable_pools: list[v1alpha1.SchedulablePool],
+        node_pools: list[v1alpha1.NodePoolModel] | None,
+    ) -> None:
+        """Write the InferenceCluster status, with status.nodePools unless node_pools is None."""
         status = v1alpha1.Status(
             providerConfigRef=v1alpha1.ProviderConfigRef(
                 name=resource.child_name(_name(self.xr.metadata), "cluster-kubeconfig"),
@@ -1277,6 +1396,8 @@ class Composer:
             namespace=_NAMESPACE_SYSTEM,
             schedulablePools=schedulable_pools,
         )
+        if node_pools is not None:
+            status.nodePools = node_pools
         cache_storage_class = self.observed_cache_storage_class()
         if cache_storage_class:
             status.cache = v1alpha1.CacheModel(storageClassName=cache_storage_class)
@@ -1316,38 +1437,68 @@ class Composer:
             status.model_dump(mode="json", exclude_unset=True, by_alias=True, warnings=False),
         )
 
-    def derive_conditions(self, *, cluster_ready: bool) -> None:
-        """Derive ClusterReady and BackendReady conditions."""
-        backend_ready = (
-            resource.get_condition(self.req.observed.resources.get(BACKEND_RESOURCE_KEY), "Ready").status == "True"
-        )
-        if BACKEND_RESOURCE_KEY in self.rsp.desired.resources and backend_ready:
+    def relayed_node_pools(self, cluster: str) -> list[v1alpha1.NodePoolModel]:
+        """Each node pool's state, as the cloud cluster XR composed as cluster reports it.
+
+        A pool the cloud cluster XR doesn't report is Pending, as every pool is
+        before the cloud cluster XR exists.
+        """
+        observed = self.req.observed.resources.get(cluster)
+        status = (resource.struct_to_dict(observed.resource).get("status") or {}) if observed else {}
+        reported = {p["name"]: p for p in status.get("nodePools") or []}
+        return [
+            v1alpha1.NodePoolModel.model_validate(reported[pool.name])
+            if pool.name in reported
+            else v1alpha1.NodePoolModel(name=pool.name, state=_POOL_STATE_PENDING)
+            for pool in self.xr.spec.nodePools or []
+        ]
+
+    def derive_conditions(self, *, cluster: str | None) -> None:
+        """Derive the stage conditions of a cluster Accepted for composing."""
+        if (
+            BACKEND_RESOURCE_KEY in self.rsp.desired.resources
+            and resource.get_condition(self.req.observed.resources.get(BACKEND_RESOURCE_KEY), "Ready").status == "True"
+        ):
             self.rsp.desired.resources[BACKEND_RESOURCE_KEY].ready = fnv1.READY_TRUE
 
-        response.set_conditions(
-            self.rsp,
-            resource.Condition(
-                typ=CONDITION_TYPE_CLUSTER_READY,
-                status="True" if cluster_ready else "False",
-                reason=CONDITION_REASON_CLUSTER_RUNNING if cluster_ready else CONDITION_REASON_PROVISIONING,
-            ),
-        )
+        accepted = resource.Condition(typ=CONDITION_TYPE_ACCEPTED, status="True", reason=CONDITION_REASON_AVAILABLE)
+        response.set_conditions(self.rsp, accepted, *self.stage_conditions(accepted, cluster=cluster))
 
-        if not cluster_ready:
-            backend_reason = CONDITION_REASON_WAITING_FOR_CLUSTER
-        elif backend_ready:
-            backend_reason = CONDITION_REASON_BACKEND_HEALTHY
+    def stage_conditions(
+        self, accepted: resource.Condition, *, cluster: str | None
+    ) -> tuple[resource.Condition, resource.Condition, resource.Condition]:
+        """ClusterReady, NodePoolsReady and ServingStackReady, relaying the first
+        two from the cloud cluster XR composed as cluster. cluster is None for an
+        Existing cluster, which Modelplane doesn't provision.
+
+        A stage whose resources aren't observed yet is Pending on the stage
+        before it, Accepted included.
+        """
+        if cluster is None:
+            cluster_ready = resource.Condition(
+                typ=CONDITION_TYPE_CLUSTER_READY, status="True", reason=CONDITION_REASON_EXISTING
+            )
+            pools_ready = resource.Condition(
+                typ=CONDITION_TYPE_NODE_POOLS_READY, status="True", reason=CONDITION_REASON_EXISTING
+            )
         else:
-            backend_reason = CONDITION_REASON_INSTALLING
+            observed = self.req.observed.resources.get(cluster)
+            cluster_ready = _relay(observed, CONDITION_TYPE_CLUSTER_READY, after=accepted)
+            pools_ready = _relay(observed, CONDITION_TYPE_NODE_POOLS_READY, after=cluster_ready)
 
-        response.set_conditions(
-            self.rsp,
-            resource.Condition(
-                typ=CONDITION_TYPE_BACKEND_READY,
-                status="True" if backend_ready else "False",
-                reason=backend_reason,
-            ),
-        )
+        backend = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+        waiting_on = next((c.typ for c in (pools_ready, accepted) if c.status != "True"), None)
+        if resource.get_condition(backend, "Ready").status == "True":
+            serving_stack = resource.Condition(
+                typ=CONDITION_TYPE_SERVING_STACK_READY, status="True", reason=CONDITION_REASON_AVAILABLE
+            )
+        elif backend is None and waiting_on is not None:
+            serving_stack = _pending(CONDITION_TYPE_SERVING_STACK_READY, after=waiting_on)
+        else:
+            serving_stack = resource.Condition(
+                typ=CONDITION_TYPE_SERVING_STACK_READY, status="False", reason=CONDITION_REASON_PROVISIONING
+            )
+        return cluster_ready, pools_ready, serving_stack
 
     def compose_gke_cluster(self, gke: v1alpha1.Gke) -> bool:
         """Compose a GKECluster XR.
@@ -2136,6 +2287,144 @@ class Composer:
             return None
         return next((s for s in coreweave_secrets if s.type == secret_type), None)
 
+    def compose_upcloud_cluster(self, upcloud: v1alpha1.Upcloud) -> bool:
+        """Compose an UpCloudCluster XR.
+
+        Combines the cluster-level config (zone, autoscaler credentials)
+        with inference node pools derived from the user's node pools +
+        referenced classes, GPU or CPU by whether the class sets an
+        accelerator. The system pool is injected by compose-upcloud-cluster.
+
+        Returns False, having failed the reconcile, if a node pool is invalid.
+        """
+        upcloud_node_pools: list[upcloudv1alpha1.NodePool] = []
+
+        for pool in self.xr.spec.nodePools or []:
+            cls = self.classes[pool.className]
+            if not cls.spec.provisioning or not cls.spec.provisioning.upcloud:
+                msg = f"InferenceClass {pool.className} has no UpCloud provisioning block"
+                self.fail(CONDITION_REASON_INVALID_NODE_POOL, msg)
+                return False
+            prov = cls.spec.provisioning.upcloud
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above).
+            node_pool = upcloudv1alpha1.NodePool(
+                name=pool.name,
+                role="GPU" if prov.accelerator else "CPU",
+                plan=prov.plan,
+                diskSizeGb=prov.diskSizeGb,
+                nodeCount=pool.nodeCount,
+            )
+            if prov.accelerator:
+                node_pool.gpu = upcloudv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                )
+            # Only set the autoscaling bounds when the pool opts in, so
+            # fixed-size pools stay fixed (resource.update serializes with
+            # exclude_unset, keeping unset bounds out of the UpCloudCluster
+            # spec rather than emitting maxNodeCount: null). Fabric is not
+            # mapped: UKS has no EFA or InfiniBand analog.
+            if pool.maxNodeCount is not None:
+                node_pool.maxNodeCount = pool.maxNodeCount
+            if pool.minNodeCount is not None:
+                node_pool.minNodeCount = pool.minNodeCount
+            upcloud_node_pools.append(node_pool)
+
+        upcloud_spec = upcloudv1alpha1.Spec(
+            zone=upcloud.zone,
+            kubernetesVersion=upcloud.kubernetesVersion,
+            nodePools=upcloud_node_pools,
+        )
+        if upcloud.credentials:
+            upcloud_spec.credentials = upcloudv1alpha1.Credentials(
+                type=upcloud.credentials.type,
+                name=upcloud.credentials.name,
+            )
+        # The autoscaler's token Secret is in modelplane-system, the
+        # namespace the UpCloudCluster is composed into, so the ref passes
+        # through unchanged.
+        if upcloud.autoscaler:
+            upcloud_spec.autoscaler = upcloudv1alpha1.Autoscaler(
+                secretRef=upcloudv1alpha1.SecretRef(
+                    name=upcloud.autoscaler.secretRef.name,
+                    key=upcloud.autoscaler.secretRef.key,
+                ),
+            )
+        resource.update(
+            self.rsp.desired.resources["upcloud-cluster"],
+            upcloudv1alpha1.UpCloudCluster(
+                metadata=metav1.ObjectMeta(
+                    name=_name(self.xr.metadata),
+                    namespace=_NAMESPACE_SYSTEM,
+                ),
+                spec=upcloud_spec,
+            ),
+        )
+        return True
+
+    def compose_upcloud_usage(self) -> None:
+        """Block UpCloudCluster deletion until the backend is deleted."""
+        resource.update(
+            self.rsp.desired.resources["usage-upcloud-by-backend"],
+            usagev1beta1.Usage(
+                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                spec=usagev1beta1.Spec(
+                    of=usagev1beta1.Of(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="UpCloudCluster",
+                        resourceSelector=usagev1beta1.ResourceSelectorModel(matchControllerRef=True),
+                    ),
+                    by=usagev1beta1.By(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="ServingStack",
+                        resourceSelector=usagev1beta1.ResourceSelector(matchControllerRef=True),
+                    ),
+                    replayDeletion=True,
+                ),
+            ),
+        )
+        self.rsp.desired.resources["usage-upcloud-by-backend"].ready = fnv1.READY_TRUE
+
+    def resolve_upcloud_backend_secrets(
+        self, *, upcloud_ready: bool, backend_exists: bool
+    ) -> list[ssv1alpha1.Secret] | None:
+        """Resolve secrets for the backend from UpCloudCluster status. Falls
+        back to the observed backend's spec.secrets if UpCloudCluster
+        secrets aren't available but the backend already exists."""
+        upcloud_secrets = self.observed_upcloud_secrets()
+
+        if upcloud_ready and upcloud_secrets:
+            return [ssv1alpha1.Secret(type=s.type, name=s.name, key=s.key) for s in upcloud_secrets]
+
+        if backend_exists:
+            observed = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+            if observed:
+                d = resource.struct_to_dict(observed.resource)
+                observed_secrets = d.get("spec", {}).get("secrets", [])
+                if observed_secrets:
+                    return [ssv1alpha1.Secret(type=s["type"], name=s["name"], key=s["key"]) for s in observed_secrets]
+
+        return None
+
+    def observed_upcloud_secrets(self) -> list[upcloudv1alpha1.Secret] | None:
+        """Read the UpCloudCluster's status.secrets from observed state."""
+        upcloud_observed = self.req.observed.resources.get("upcloud-cluster")
+        if not upcloud_observed:
+            return None
+        observed_upcloud = upcloudv1alpha1.UpCloudCluster.model_validate(
+            resource.struct_to_dict(upcloud_observed.resource)
+        )
+        if not observed_upcloud.status:
+            return None
+        return observed_upcloud.status.secrets
+
+    def observed_upcloud_secret(self, secret_type: str) -> upcloudv1alpha1.Secret | None:
+        """Read a specific secret from the observed UpCloudCluster status."""
+        upcloud_secrets = self.observed_upcloud_secrets()
+        if not upcloud_secrets:
+            return None
+        return next((s for s in upcloud_secrets if s.type == secret_type), None)
+
     def compose_eks_usage(self) -> None:
         """Block EKSCluster deletion until the backend is deleted."""
         resource.update(
@@ -2383,8 +2672,9 @@ class Composer:
 
         For provisioned clusters it comes from the backing cluster's
         status.cache.storageClassName, which reports the Modelplane-managed
-        class. Vultr and Civo are absent: their cluster XRs report no
-        cache StorageClass (neither cloud has usable RWX storage).
+        class. Vultr, Civo and UpCloud are absent: their cluster XRs report
+        no cache StorageClass (none of the three has RWX storage usable for
+        the cache - UpCloud's File Storage NFS has no CSI driver).
         For Existing clusters there is no cluster XR, so it's the
         user-supplied name. None until the cluster XR reports it."""
         provisioned = {
