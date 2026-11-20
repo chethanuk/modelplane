@@ -495,6 +495,8 @@ def _config(
                             'set(datapoint.attributes["status"], "server_error") where metric.name == "sglang:http_responses_total" and datapoint.attributes["status_code"] == "500"',
                             'set(datapoint.attributes["status"], "server_error") where metric.name == "sglang:http_responses_total" and datapoint.attributes["status_code"] == "503"',
                             'delete_key(datapoint.attributes, "status_code") where metric.name == "sglang:http_responses_total"',
+                            'set(datapoint.attributes["reason"], datapoint.attributes["error_code"]) where metric.name == "llm_d_epp_request_error_total"',
+                            'delete_key(datapoint.attributes, "error_code") where metric.name == "llm_d_epp_request_error_total"',
                         ],
                     },
                     {
@@ -532,6 +534,8 @@ def _config(
                             'set(metric.name, "modelplane_engine_requests_total") where metric.name == "sglang:prompt_tokens_histogram_count"',
                             'set(metric.name, "modelplane_engine_responses_total") where metric.name == "sglang:http_responses_total"',
                             'set(metric.name, "modelplane_route_decision_seconds") where metric.name == "llm_d_epp_scheduler_e2e_duration_seconds"',
+                            'set(metric.name, "modelplane_route_requests_total") where metric.name == "llm_d_epp_request_total"',
+                            'set(metric.name, "modelplane_route_request_errors_total") where metric.name == "llm_d_epp_request_error_total"',
                             'set(metric.name, "modelplane_gpu_memory_used_bytes") where metric.name == "DCGM_FI_DEV_FB_USED"',
                             'set(metric.name, "modelplane_gpu_memory_free_bytes") where metric.name == "DCGM_FI_DEV_FB_FREE"',
                             'set(metric.name, "modelplane_gpu_compute_active_ratio") where metric.name == "DCGM_FI_PROF_GR_ENGINE_ACTIVE"',
@@ -992,6 +996,8 @@ STATEMENTS_CASES = [
                 'set(datapoint.attributes["status"], "server_error") where metric.name == "sglang:http_responses_total" and datapoint.attributes["status_code"] == "500"',
                 'set(datapoint.attributes["status"], "server_error") where metric.name == "sglang:http_responses_total" and datapoint.attributes["status_code"] == "503"',
                 'delete_key(datapoint.attributes, "status_code") where metric.name == "sglang:http_responses_total"',
+                'set(datapoint.attributes["reason"], datapoint.attributes["error_code"]) where metric.name == "llm_d_epp_request_error_total"',
+                'delete_key(datapoint.attributes, "error_code") where metric.name == "llm_d_epp_request_error_total"',
             ],
             [
                 'set(metric.name, "modelplane_frontend_request_duration_seconds") where metric.name == "gen_ai_server_request_duration_seconds"',
@@ -1029,6 +1035,8 @@ STATEMENTS_CASES = [
                 'set(metric.name, "modelplane_engine_requests_total") where metric.name == "sglang:prompt_tokens_histogram_count"',
                 'set(metric.name, "modelplane_engine_responses_total") where metric.name == "sglang:http_responses_total"',
                 'set(metric.name, "modelplane_route_decision_seconds") where metric.name == "llm_d_epp_scheduler_e2e_duration_seconds"',
+                'set(metric.name, "modelplane_route_requests_total") where metric.name == "llm_d_epp_request_total"',
+                'set(metric.name, "modelplane_route_request_errors_total") where metric.name == "llm_d_epp_request_error_total"',
                 'set(metric.name, "modelplane_gpu_memory_used_bytes") where metric.name == "DCGM_FI_DEV_FB_USED"',
                 'set(metric.name, "modelplane_gpu_memory_free_bytes") where metric.name == "DCGM_FI_DEV_FB_FREE"',
                 'set(metric.name, "modelplane_gpu_compute_active_ratio") where metric.name == "DCGM_FI_PROF_GR_ENGINE_ACTIVE"',
@@ -1245,7 +1253,7 @@ OBJECTS_CASES = [
             (
                 "collector",
                 _deployment(
-                    config_hash="522e31c7cedc07c5",
+                    config_hash="cccd2d383b44a9b6",
                     volumes=[{"name": "config", "configMap": {"name": "modelplane-collector"}}],
                     volume_mounts=[{"name": "config", "mountPath": "/conf"}],
                     env_from=None,
@@ -1290,7 +1298,7 @@ OBJECTS_CASES = [
             (
                 "collector",
                 _deployment(
-                    config_hash="1f03e323432223be",
+                    config_hash="f1330fe20eb12eb7",
                     volumes=[
                         {"name": "config", "configMap": {"name": "modelplane-collector"}},
                         {"name": "credentials-primary", "secret": {"secretName": "telemetry-credentials"}},
@@ -1357,7 +1365,7 @@ OBJECTS_CASES = [
             (
                 "collector",
                 _deployment(
-                    config_hash="b1539f5a25d85bfc",
+                    config_hash="8dbfa5a379b8dff3",
                     volumes=[
                         {"name": "config", "configMap": {"name": "modelplane-collector"}},
                         {"name": "credentials-vendor", "secret": {"secretName": "vendor-token"}},
