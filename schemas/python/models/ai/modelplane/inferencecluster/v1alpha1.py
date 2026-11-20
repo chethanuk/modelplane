@@ -143,6 +143,37 @@ class Nebius(BaseModel):
     """
 
 
+class SecretRefModel(BaseModel):
+    key: constr(min_length=1, max_length=253) | None = 'token'
+    name: constr(min_length=1, max_length=253)
+
+
+class Autoscaler(BaseModel):
+    secretRef: SecretRefModel
+    """
+    Reference to a Secret in the modelplane-system namespace holding an UpCloud API token.
+    """
+
+
+class Upcloud(BaseModel):
+    autoscaler: Autoscaler | None = None
+    """
+    Credentials for the Kubernetes cluster autoscaler that scales pools with maxNodeCount set. UpCloud provisions no API credentials on UKS clusters, so the referenced Secret is copied to the cluster for the autoscaler to read. Required when any pool sets maxNodeCount.
+    """
+    credentials: Credentials | None = None
+    """
+    UpCloud ProviderConfig or ClusterProviderConfig used to authenticate to the UpCloud API. Defaults to the ClusterProviderConfig named default.
+    """
+    kubernetesVersion: constr(min_length=1, max_length=16) | None = '1.36'
+    """
+    UKS Kubernetes version as major.minor (e.g. 1.36); list current versions with upctl kubernetes versions. Defaults to the newest UKS version. Choose 1.34 or newer so Dynamic Resource Allocation (how GPUs bind to pods) is generally available.
+    """
+    zone: constr(min_length=1, max_length=32)
+    """
+    UpCloud zone for the cluster (e.g. fi-hel2, de-fra1). GPU plans are currently available in fi-hel2 only.
+    """
+
+
 class Vultr(BaseModel):
     credentials: Credentials | None = None
     """
@@ -188,10 +219,22 @@ class Cluster(BaseModel):
     Nebius mk8s cluster configuration. Required when source is Nebius; may be empty, since every field has a default. The cluster is created in the project the referenced ProviderConfig or ClusterProviderConfig sets as its projectID; Nebius projects are bound to a region, so the project also determines where the cluster runs.
     """
     source: Literal[
-        'GKE', 'EKS', 'AKS', 'Nebius', 'Vultr', 'Civo', 'CoreWeave', 'Existing'
+        'GKE',
+        'EKS',
+        'AKS',
+        'Nebius',
+        'Vultr',
+        'Civo',
+        'CoreWeave',
+        'UpCloud',
+        'Existing',
     ]
     """
     Cluster provisioning method.
+    """
+    upcloud: Upcloud | None = None
+    """
+    UpCloud Managed Kubernetes (UKS) cluster configuration. Required when source is UpCloud.
     """
     vultr: Vultr | None = None
     """
@@ -270,6 +313,9 @@ class NodePool(BaseModel):
     Maximum node count for autoscaling. Omit for fixed-size pools.
     """
     minNodeCount: conint(ge=0) | None = None
+    """
+    Minimum node count for autoscaling. Some providers' cluster autoscalers can't scale a pool whose devices bind through DRA up from zero nodes, so a pod scheduled to an empty pool waits forever. See the provider cluster's minNodeCount for which pools must stay at 1 or higher.
+    """
     name: constr(pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', max_length=40)
     """
     Name of the pool. Its nodes carry it as the value of the modelplane.ai/pool label, and the cluster agent observes the pool through an object of this name.
@@ -361,6 +407,21 @@ class Gateway(BaseModel):
     """
 
 
+class NodePoolModel(BaseModel):
+    message: str | None = None
+    """
+    The provider's error, prefixed with the name of the composed resource it's about. Set only when state is Failed.
+    """
+    name: constr(max_length=40)
+    """
+    Name of the node pool in spec.nodePools.
+    """
+    state: Literal['Pending', 'Provisioning', 'Ready', 'Failed']
+    """
+    Pending until Modelplane composes the pool's cloud resources, Provisioning until their provider reports them all Ready, then Ready. Failed while the provider reports that its last create, update or delete of one of them failed.
+    """
+
+
 class ProviderConfigRef(BaseModel):
     name: str | None = None
     """
@@ -443,6 +504,10 @@ class Status(BaseModel):
     namespace: str | None = None
     """
     Namespace where the internal XRs (cluster, backend) were created.
+    """
+    nodePools: list[NodePoolModel] | None = Field(None, max_length=8)
+    """
+    The provisioning state of each node pool in spec.nodePools, as the cluster Modelplane provisions reports it. Not set when source is Existing, because Modelplane doesn't provision those pools.
     """
     providerConfigRef: ProviderConfigRef | None = None
     schedulablePools: list[SchedulablePool] | None = Field(None, max_length=8)

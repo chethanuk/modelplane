@@ -11,7 +11,8 @@ serving. Platform teams create these to provide GPU capacity.
 
 Each cluster has:
 
-- A **cluster source**: `GKE`, `EKS`, `AKS`, `Nebius`, `Vultr`, `Civo` or `CoreWeave` (Modelplane
+- A **cluster source**: `GKE`, `EKS`, `AKS`, `Nebius`, `Vultr`, `Civo`,
+  `CoreWeave` or `UpCloud` (Modelplane
   provisions the full cluster) or `Existing` (bring a cluster you manage yourself). See
   [Supported Providers]({{< ref "platform/providers.md" >}}) for the clouds and
   neoclouds Modelplane runs on.
@@ -40,7 +41,8 @@ cluster](#requirements-for-an-existing-cluster) sets out.
 
 The `cluster.source` discriminator picks one of two models:
 
-- **Provisioned (`GKE`, `EKS`, `AKS`, `Nebius`, `Vultr`, `Civo`, `CoreWeave`).** Modelplane creates the cluster and its GPU node
+- **Provisioned (`GKE`, `EKS`, `AKS`, `Nebius`, `Vultr`, `Civo`, `CoreWeave`,
+  `UpCloud`).** Modelplane creates the cluster and its GPU node
   pools from each pool's `InferenceClass`, labels the pool's nodes so the
   scheduler's placement is enforced, and provisions the storage class for model
   weights. It also injects a non-GPU **system pool** with opinionated defaults to
@@ -107,6 +109,50 @@ must meet what Modelplane would otherwise set up for you:
   brings its own exporter. [GPUs]({{< ref "/platform/telemetry.md#gpus" >}})
   describes how the collector discovers the exporter, the DCGM fields it
   needs, and how to check what yours publishes.
+
+## Provisioning status
+
+An `InferenceCluster` reports how far provisioning has got through four
+conditions, one for each stage:
+
+| Condition | Covers | Reasons while not `True` |
+|---|---|---|
+| `Accepted` | The node pools' classes and capacity reservations exist and suit the cloud, and the classes claim devices the cloud supports. | `WaitingForClasses`, `WaitingForReservations`, `InvalidNodePool`, `UnsupportedDevices` |
+| `ClusterReady` | The network, control plane, system nodes and cluster add-ons. | `Pending`, `Provisioning`, `Failed` |
+| `NodePoolsReady` | The node pools in `spec.nodePools`. | `Pending`, `Provisioning`, `Failed` |
+| `ServingStackReady` | The serving stack. | `Pending`, `Provisioning` |
+
+A stage that's done is `True` with the reason `Available`. A stage is `Pending`
+while it waits for an earlier one, so while a new cluster provisions, the first
+condition that isn't `True` names the stage it's in. Once a stage has started,
+it reports its own state: on a running cluster, the serving stack stays
+`Available` while a node pool you add is `Provisioning`.
+
+`Provisioning` means Modelplane is creating or updating the stage's resources.
+`ClusterReady`'s message counts how many of them are ready, and
+`NodePoolsReady`'s counts the ready pools.
+
+`Failed` means the cloud provider reports that its last create, update or
+delete of one of the stage's resources failed. `ClusterReady`'s message is the
+provider's error, prefixed with the resource's name. `NodePoolsReady`'s message
+names the failed pools, and each pool's error is in `status.nodePools`. Only
+resources the cloud provider creates asynchronously, such as the control plane
+and node groups, report failures this way. A failed IAM role, Helm release or
+in-cluster object leaves its stage `Provisioning`.
+
+An `Existing` cluster reports `ClusterReady` and `NodePoolsReady` with the
+reason `Existing`, because Modelplane doesn't provision it.
+
+`kubectl get` shows each stage's reason:
+
+```bash
+kubectl get ic eks-us-east
+```
+
+```text
+NAME          SOURCE   CLUSTER     POOLS          STACK     GATEWAY   SYNCED   READY   COMPOSITION                          AGE
+eks-us-east   EKS      Available   Provisioning   Pending             True     False   inferenceclusters.modelplane.ai      24m
+```
 
 ## Serving stack
 
@@ -199,6 +245,9 @@ pool.
 {{< tab "CoreWeave" >}}
 {{< manifests path="concepts/inference-cluster-coreweave.yaml" apply="false" >}}
 {{< /tab >}}
+{{< tab "UpCloud" >}}
+{{< manifests path="concepts/inference-cluster-upcloud.yaml" apply="false" >}}
+{{< /tab >}}
 {{< tab "Existing" >}}
 {{< manifests path="concepts/inference-cluster-existing.yaml" apply="false" >}}
 {{< /tab >}}
@@ -215,11 +264,13 @@ depends on the source:
   **`Nebius`** (shared filesystem), and **`CoreWeave`** (Distributed File
   Storage): auto-provisioned. Those classes are fixed; nothing for the admin
   to do.
-- **`Vultr`** and **`Civo`**: none. VKE's built-in RWX class (Vultr File
-  System) isn't usable on GPU nodes, Civo's `civo-volume` class is
-  `ReadWriteOnce` only, and Modelplane doesn't provision an alternative
-  on either. Deploy single-node engines without a `ModelCache` and let
-  them pull weights directly from the model source.
+- **`Vultr`**, **`Civo`** and **`UpCloud`**: none. VKE's built-in RWX class
+  (Vultr File System) isn't usable on GPU nodes, Civo's `civo-volume` class
+  is `ReadWriteOnce` only, UpCloud's File Storage NFS has no CSI driver (it
+  only supports statically provisioned volumes), and Modelplane doesn't
+  provision an alternative on any of them. Deploy single-node engines
+  without a `ModelCache` and let them pull weights directly from the model
+  source.
 - **`Existing`**: bring your own. Create an RWX StorageClass on the cluster, with
   any backend that supports automatic PVC provisioning (WekaIO, NetApp Trident,
   `FSx` for NetApp, and similar), and name it in

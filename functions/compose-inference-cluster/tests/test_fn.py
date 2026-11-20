@@ -62,14 +62,16 @@ def _inference_cluster(*, cluster: v1alpha1.Cluster, node_pools: list[v1alpha1.N
 
 
 def _desired_inference_cluster(
-    *, schedulable_pools: list[dict], cache: dict | None, gateway: dict | None
+    *, schedulable_pools: list[dict], node_pools: list[dict] | None, cache: dict | None, gateway: dict | None
 ) -> fnv1.Resource:
-    """The desired InferenceCluster XR's status, with its cache and gateway unless they're None."""
+    """The desired InferenceCluster XR's status, with its node pools, cache and gateway unless they're None."""
     status: dict = {
         "providerConfigRef": {"name": "test-cluster-cluster-kubeconfig-d0f89"},
         "namespace": "modelplane-system",
         "schedulablePools": schedulable_pools,
     }
+    if node_pools is not None:
+        status["nodePools"] = node_pools
     if cache is not None:
         status["cache"] = cache
     if gateway is not None:
@@ -281,6 +283,41 @@ def _eks_cluster(
     )
 
 
+def _observed_eks_cluster(
+    *, ready: bool, conditions: list[dict], node_pools: list[dict], cache: dict | None
+) -> fnv1.Resource:
+    """The observed EKSCluster with l4-pool, reporting conditions and node_pools, and its cache unless it's None."""
+    status: dict = {
+        "conditions": [
+            {**c, "lastTransitionTime": "2024-01-01T00:00:00Z"}
+            for c in [
+                {"type": "Ready", "status": "True", "reason": "Available"}
+                if ready
+                else {"type": "Ready", "status": "False", "reason": "Creating"},
+                *conditions,
+            ]
+        ],
+        "nodePools": node_pools,
+        "secrets": [{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+    }
+    if cache is not None:
+        status["cache"] = cache
+    return fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {
+                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                "kind": "EKSCluster",
+                "metadata": {"name": "test-cluster", "namespace": "modelplane-system"},
+                "spec": {
+                    "region": "us-west-2",
+                    "nodePools": [{"name": "l4-pool", "role": "GPU", "instanceType": "g6.xlarge", "nodeCount": 2}],
+                },
+                "status": status,
+            }
+        )
+    )
+
+
 def _vultr_cluster(*, credentials: dict | None, ready: fnv1.Ready) -> fnv1.Resource:
     """The composed VultrCluster with l40s-pool, using credentials unless they're None."""
     spec: dict = {
@@ -375,6 +412,28 @@ def _coreweave_cluster(*, node_pools: list[dict], credentials: dict | None, read
     )
 
 
+def _upcloud_cluster(
+    *, node_pools: list[dict], credentials: dict | None, autoscaler: dict | None, ready: fnv1.Ready
+) -> fnv1.Resource:
+    """The composed UpCloudCluster in fi-hel2 with node_pools, using credentials and autoscaler unless they're None."""
+    spec: dict = {"zone": "fi-hel2", "kubernetesVersion": "1.36", "nodePools": node_pools}
+    if credentials is not None:
+        spec["credentials"] = credentials
+    if autoscaler is not None:
+        spec["autoscaler"] = autoscaler
+    return fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {
+                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                "kind": "UpCloudCluster",
+                "metadata": {"name": "test-cluster", "namespace": "modelplane-system"},
+                "spec": spec,
+            }
+        ),
+        ready=ready,
+    )
+
+
 def _cluster_provider_config(*, kubeconfig: str, identity: dict | None) -> fnv1.Resource:
     """The ClusterProviderConfig reaching test-cluster with the kubeconfig Secret, as identity unless it's None."""
     spec: dict = {
@@ -407,7 +466,7 @@ def _serving_stack(
     ready: fnv1.Ready,
     dra_drivers: tuple[str, ...],
 ) -> fnv1.Resource:
-    """The composed ServingStack, its gateway accepting client_cas and its spec.gpu set to gpu unless they're None.
+    """The composed ServingStack, its gateway accepting client_cas, and its spec.gpu set to gpu, unless they're None.
 
     dra_drivers is the drivers the cluster's classes claim, always stamped
     on the spec.
@@ -668,6 +727,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -723,8 +783,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -774,6 +852,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -845,8 +924,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -906,6 +1003,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -964,8 +1062,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -1066,10 +1184,28 @@ COMPOSE_CASES = [
             ],
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="InvalidNodePool",
                     message="InferenceClass gpu-l4 has no GKE provisioning block",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
                 ),
             ],
         ),
@@ -1142,6 +1278,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -1210,8 +1347,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -1333,10 +1490,28 @@ COMPOSE_CASES = [
             ],
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="InvalidNodePool",
                     message="Node pool l4-pool must set zones to [us-central1-a] to use CapacityReservation l4-calendar",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
                 ),
             ],
         ),
@@ -1457,10 +1632,28 @@ COMPOSE_CASES = [
             ],
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="InvalidNodePool",
                     message="CapacityReservation l4-block is for EKS, not GKE",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
                 ),
             ],
         ),
@@ -1539,10 +1732,28 @@ COMPOSE_CASES = [
             ],
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="WaitingForReservations",
                     message="Waiting for CapacityReservations: l4-calendar",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
                 ),
             ],
         ),
@@ -1676,6 +1887,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -1738,14 +1950,34 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
     ComposeCase(
-        name="ExistingBackendReady",
-        reason="Once its ServingStack is observed Ready with an address, an Existing cluster relays the address, reports its backend healthy, and composes a PoolObservation for each pool.",
+        name="ExistingServingStackReady",
+        reason="Once its ServingStack is observed Ready with an address, an Existing cluster relays the address, reports ServingStackReady, and composes a PoolObservation for each pool.",
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
                 composite=_inference_cluster(
@@ -1785,6 +2017,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -1841,8 +2074,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -1922,6 +2173,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -1999,8 +2251,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -2079,6 +2349,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "gpu-l4x4-a",
@@ -2138,8 +2409,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -2212,6 +2501,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "gpu-l4x4-a",
@@ -2268,8 +2558,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -2348,6 +2656,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "gpu-l4x4-a",
@@ -2407,8 +2716,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -2486,6 +2813,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "gpu-l4x4-a",
@@ -2549,8 +2877,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -2640,6 +2986,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "gpu-l4x4-a",
@@ -2698,8 +3045,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -2773,6 +3138,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -2850,8 +3216,422 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="EKSPoolsProvisioning",
+        reason="With its EKSCluster reporting the cluster ready and its pool provisioning, an EKS cluster relays both stages and the pool's state, and ServingStackReady waits on NodePoolsReady.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(source="EKS", eks=v1alpha1.Eks(region="us-west-2")),
+                    node_pools=[
+                        v1alpha1.NodePool(
+                            name="l4-pool",
+                            className="gpu-l4-eks",
+                            nodeCount=2,
+                            maxNodeCount=4,
+                            zones=["us-west-2a", "us-west-2b"],
+                        ),
+                    ],
+                ),
+                resources={
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=False,
+                        conditions=[
+                            {"type": "ClusterReady", "status": "True", "reason": "Available"},
+                            {
+                                "type": "NodePoolsReady",
+                                "status": "False",
+                                "reason": "Provisioning",
+                                "message": "0 of 1 node pools ready",
+                            },
+                        ],
+                        node_pools=[
+                            {"name": "l4-pool", "state": "Provisioning"},
+                        ],
+                        cache=None,
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4-eks": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4-eks",
+                            count=1,
+                            memory="24Gi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Provisioning"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l4-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "24Gi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l4-eks": _input_usage(kind="InferenceClass", name="gpu-l4-eks"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "eks-cluster": _eks_cluster(
+                        zones=["us-west-2a", "us-west-2b"],
+                        capacity_reservation=None,
+                        fabric=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4-eks": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4-eks"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                    message="0 of 1 node pools ready",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="EKSPoolFailed",
+        reason="With its EKSCluster reporting a failed pool while the cluster provisions, an EKS cluster relays the failure and the provider's error.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(source="EKS", eks=v1alpha1.Eks(region="us-west-2")),
+                    node_pools=[
+                        v1alpha1.NodePool(
+                            name="l4-pool",
+                            className="gpu-l4-eks",
+                            nodeCount=2,
+                            maxNodeCount=4,
+                            zones=["us-west-2a", "us-west-2b"],
+                        ),
+                    ],
+                ),
+                resources={
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=False,
+                        conditions=[
+                            {
+                                "type": "ClusterReady",
+                                "status": "False",
+                                "reason": "Provisioning",
+                                "message": "12 of 52 resources ready",
+                            },
+                            {
+                                "type": "NodePoolsReady",
+                                "status": "False",
+                                "reason": "Failed",
+                                "message": "1 of 1 node pools failed: l4-pool",
+                            },
+                        ],
+                        node_pools=[
+                            {
+                                "name": "l4-pool",
+                                "state": "Failed",
+                                "message": "nodegroup-l4-pool: async create failed: InsufficientInstanceCapacity",
+                            },
+                        ],
+                        cache=None,
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4-eks": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4-eks",
+                            count=1,
+                            memory="24Gi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[
+                        {
+                            "name": "l4-pool",
+                            "state": "Failed",
+                            "message": "nodegroup-l4-pool: async create failed: InsufficientInstanceCapacity",
+                        },
+                    ],
+                    schedulable_pools=[
+                        {
+                            "name": "l4-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "24Gi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l4-eks": _input_usage(kind="InferenceClass", name="gpu-l4-eks"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "eks-cluster": _eks_cluster(
+                        zones=["us-west-2a", "us-west-2b"],
+                        capacity_reservation=None,
+                        fabric=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4-eks": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4-eks"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                    message="12 of 52 resources ready",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Failed",
+                    message="1 of 1 node pools failed: l4-pool",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -2947,6 +3727,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -3024,8 +3805,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -3060,12 +3861,25 @@ COMPOSE_CASES = [
                                     "nodePools": [{"name": "system", "role": "System", "machineType": "e2-standard-4"}],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "l4-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2026-06-08T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
                                         },
                                     ],
                                     "cache": {"storageClassName": "modelplane-rwx"},
@@ -3123,6 +3937,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -3210,8 +4025,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -3233,38 +4066,16 @@ COMPOSE_CASES = [
                     ],
                 ),
                 resources={
-                    "eks-cluster": fnv1.Resource(
-                        resource=resource.dict_to_struct(
-                            {
-                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
-                                "kind": "EKSCluster",
-                                "metadata": {"name": "test-cluster", "namespace": "modelplane-system"},
-                                "spec": {
-                                    "region": "us-west-2",
-                                    "nodePools": [
-                                        {"name": "l4-pool", "role": "GPU", "instanceType": "g6.xlarge", "nodeCount": 2},
-                                    ],
-                                },
-                                "status": {
-                                    "conditions": [
-                                        {
-                                            "type": "Ready",
-                                            "status": "True",
-                                            "reason": "Available",
-                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
-                                        },
-                                    ],
-                                    "secrets": [
-                                        {
-                                            "type": "Kubeconfig",
-                                            "name": "test-cluster-kubeconfig-abcde",
-                                            "key": "kubeconfig",
-                                        },
-                                    ],
-                                    "cache": {"storageClassName": "modelplane-rwx-efs"},
-                                },
-                            }
-                        ),
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=True,
+                        conditions=[
+                            {"type": "ClusterReady", "status": "True", "reason": "Available"},
+                            {"type": "NodePoolsReady", "status": "True", "reason": "Available"},
+                        ],
+                        node_pools=[
+                            {"name": "l4-pool", "state": "Ready"},
+                        ],
+                        cache={"storageClassName": "modelplane-rwx-efs"},
                     ),
                     "activation": _observed_activation_policy(
                         activated=[
@@ -3318,6 +4129,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -3408,8 +4220,732 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+            ],
+        ),
+    ),
+    # An EKSCluster that was Ready goes unready whenever one of its resources
+    # does. Every Object on the cluster still reaches it through the
+    # ClusterProviderConfig, so dropping it would have Crossplane delete it from
+    # under them.
+    ComposeCase(
+        name="EKSUnreadyKeepsCPC",
+        reason="With its EKSCluster gone unready after composing the ClusterProviderConfig and ServingStack, an EKS cluster keeps both.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(source="EKS", eks=v1alpha1.Eks(region="us-west-2")),
+                    node_pools=[
+                        v1alpha1.NodePool(
+                            name="l4-pool",
+                            className="gpu-l4-eks",
+                            nodeCount=2,
+                            maxNodeCount=4,
+                            zones=["us-west-2a", "us-west-2b"],
+                        ),
+                    ],
+                ),
+                resources={
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=False,
+                        conditions=[
+                            {"type": "ClusterReady", "status": "True", "reason": "Available"},
+                            {
+                                "type": "NodePoolsReady",
+                                "status": "False",
+                                "reason": "Provisioning",
+                                "message": "0 of 1 node pools ready",
+                            },
+                        ],
+                        node_pools=[
+                            {"name": "l4-pool", "state": "Provisioning"},
+                        ],
+                        cache={"storageClassName": "modelplane-rwx-efs"},
+                    ),
+                    "cluster-provider-config-kubernetes": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "ClusterProviderConfig",
+                                "metadata": {"name": "test-cluster-cluster-kubeconfig-d0f89"},
+                            }
+                        ),
+                    ),
+                    "serving-stack": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "ServingStack",
+                                "metadata": {"name": "test-cluster-serving-stack-fd00b"},
+                                "spec": {
+                                    "secrets": [
+                                        {
+                                            "type": "Kubeconfig",
+                                            "name": "test-cluster-kubeconfig-abcde",
+                                            "key": "kubeconfig",
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4-eks": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4-eks",
+                            count=1,
+                            memory="24Gi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Provisioning"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l4-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "24Gi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache={"storageClassName": "modelplane-rwx-efs"},
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l4-eks": _input_usage(kind="InferenceClass", name="gpu-l4-eks"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "eks-cluster": _eks_cluster(
+                        zones=["us-west-2a", "us-west-2b"],
+                        capacity_reservation=None,
+                        fabric=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="test-cluster-kubeconfig-abcde", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="EKS",
+                        dra_drivers=("gpu.nvidia.com",),
+                        secrets=[{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "usage-eks-by-backend": _backend_usage(cluster_kind="EKSCluster"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4-eks": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4-eks"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                    message="0 of 1 node pools ready",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+            ],
+        ),
+    ),
+    # compose-eks-cluster turns the pool's capacityReservation into a
+    # CAPACITY_BLOCK node group.
+    ComposeCase(
+        name="PoolAddedStackReady",
+        reason="With a node pool provisioning on a running cluster whose ServingStack is Ready, ServingStackReady stays True while NodePoolsReady is Provisioning.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(source="EKS", eks=v1alpha1.Eks(region="us-west-2")),
+                    node_pools=[
+                        v1alpha1.NodePool(
+                            name="l4-pool",
+                            className="gpu-l4-eks",
+                            nodeCount=2,
+                            maxNodeCount=4,
+                            zones=["us-west-2a", "us-west-2b"],
+                        ),
+                    ],
+                ),
+                resources={
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=False,
+                        conditions=[
+                            {"type": "ClusterReady", "status": "True", "reason": "Available"},
+                            {
+                                "type": "NodePoolsReady",
+                                "status": "False",
+                                "reason": "Provisioning",
+                                "message": "0 of 1 node pools ready",
+                            },
+                        ],
+                        node_pools=[
+                            {"name": "l4-pool", "state": "Provisioning"},
+                        ],
+                        cache={"storageClassName": "modelplane-rwx-efs"},
+                    ),
+                    "cluster-provider-config-kubernetes": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "ClusterProviderConfig",
+                                "metadata": {"name": "test-cluster-cluster-kubeconfig-d0f89"},
+                            }
+                        ),
+                    ),
+                    "serving-stack": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "ServingStack",
+                                "metadata": {"name": "test-cluster-serving-stack-fd00b"},
+                                "spec": {
+                                    "secrets": [
+                                        {
+                                            "type": "Kubeconfig",
+                                            "name": "test-cluster-kubeconfig-abcde",
+                                            "key": "kubeconfig",
+                                        },
+                                    ],
+                                },
+                                "status": {
+                                    "conditions": [
+                                        {
+                                            "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4-eks": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4-eks",
+                            count=1,
+                            memory="24Gi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Provisioning"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l4-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "24Gi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache={"storageClassName": "modelplane-rwx-efs"},
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l4-eks": _input_usage(kind="InferenceClass", name="gpu-l4-eks"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "eks-cluster": _eks_cluster(
+                        zones=["us-west-2a", "us-west-2b"],
+                        capacity_reservation=None,
+                        fabric=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="test-cluster-kubeconfig-abcde", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="EKS",
+                        dra_drivers=("gpu.nvidia.com",),
+                        secrets=[{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "pool-observation-l4-pool": _pool_observation(pool="l4-pool"),
+                    "usage-eks-by-backend": _backend_usage(cluster_kind="EKSCluster"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4-eks": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4-eks"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                    message="0 of 1 node pools ready",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+            ],
+        ),
+    ),
+    # compose-eks-cluster turns the pool's capacityReservation into a
+    # CAPACITY_BLOCK node group.
+    ComposeCase(
+        name="EKSClusterFunctionFailed",
+        reason="With its EKSCluster still Ready but its stage conditions Unknown after a fatal error in its function, an EKS cluster relays ClusterReady and NodePoolsReady as Unknown rather than True.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(source="EKS", eks=v1alpha1.Eks(region="us-west-2")),
+                    node_pools=[
+                        v1alpha1.NodePool(
+                            name="l4-pool",
+                            className="gpu-l4-eks",
+                            nodeCount=2,
+                            maxNodeCount=4,
+                            zones=["us-west-2a", "us-west-2b"],
+                        ),
+                    ],
+                ),
+                resources={
+                    "eks-cluster": _observed_eks_cluster(
+                        ready=True,
+                        conditions=[
+                            {
+                                "type": "ClusterReady",
+                                "status": "Unknown",
+                                "reason": "FatalError",
+                                "message": "A fatal error occurred before the status of this condition could be determined.",
+                            },
+                            {
+                                "type": "NodePoolsReady",
+                                "status": "Unknown",
+                                "reason": "FatalError",
+                                "message": "A fatal error occurred before the status of this condition could be determined.",
+                            },
+                        ],
+                        node_pools=[
+                            {"name": "l4-pool", "state": "Ready"},
+                        ],
+                        cache={"storageClassName": "modelplane-rwx-efs"},
+                    ),
+                    "cluster-provider-config-kubernetes": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "ClusterProviderConfig",
+                                "metadata": {"name": "test-cluster-cluster-kubeconfig-d0f89"},
+                            }
+                        ),
+                    ),
+                    "serving-stack": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "ServingStack",
+                                "metadata": {"name": "test-cluster-serving-stack-fd00b"},
+                                "spec": {
+                                    "secrets": [
+                                        {
+                                            "type": "Kubeconfig",
+                                            "name": "test-cluster-kubeconfig-abcde",
+                                            "key": "kubeconfig",
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4-eks": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4-eks",
+                            count=1,
+                            memory="24Gi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Ready"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l4-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "24Gi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache={"storageClassName": "modelplane-rwx-efs"},
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l4-eks": _input_usage(kind="InferenceClass", name="gpu-l4-eks"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "eips.ec2.aws.m.upbound.io",
+                            "internetgateways.ec2.aws.m.upbound.io",
+                            "launchtemplates.ec2.aws.m.upbound.io",
+                            "natgateways.ec2.aws.m.upbound.io",
+                            "routes.ec2.aws.m.upbound.io",
+                            "routetables.ec2.aws.m.upbound.io",
+                            "routetableassociations.ec2.aws.m.upbound.io",
+                            "securitygroups.ec2.aws.m.upbound.io",
+                            "securitygroupegressrules.ec2.aws.m.upbound.io",
+                            "securitygroupingressrules.ec2.aws.m.upbound.io",
+                            "subnets.ec2.aws.m.upbound.io",
+                            "vpcs.ec2.aws.m.upbound.io",
+                            "filesystems.efs.aws.m.upbound.io",
+                            "mounttargets.efs.aws.m.upbound.io",
+                            "addons.eks.aws.m.upbound.io",
+                            "clusters.eks.aws.m.upbound.io",
+                            "clusterauths.eks.aws.m.upbound.io",
+                            "nodegroups.eks.aws.m.upbound.io",
+                            "podidentityassociations.eks.aws.m.upbound.io",
+                            "policies.iam.aws.m.upbound.io",
+                            "roles.iam.aws.m.upbound.io",
+                            "rolepolicyattachments.iam.aws.m.upbound.io",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "eks-cluster": _eks_cluster(
+                        zones=["us-west-2a", "us-west-2b"],
+                        capacity_reservation=None,
+                        fabric=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="test-cluster-kubeconfig-abcde", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="EKS",
+                        dra_drivers=("gpu.nvidia.com",),
+                        secrets=[{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "usage-eks-by-backend": _backend_usage(cluster_kind="EKSCluster"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4-eks": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4-eks"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_UNKNOWN,
+                    reason="FatalError",
+                    message="A fatal error occurred before the status of this condition could be determined.",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_UNKNOWN,
+                    reason="FatalError",
+                    message="A fatal error occurred before the status of this condition could be determined.",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -3497,6 +5033,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -3578,8 +5115,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -3729,10 +5286,28 @@ COMPOSE_CASES = [
             ],
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="InvalidNodePool",
                     message="CapacityReservation l4-block is in region us-east-2, but the cluster is in us-west-2",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
                 ),
             ],
         ),
@@ -3810,6 +5385,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -3884,8 +5460,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -3949,6 +5545,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -4029,8 +5626,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -4076,9 +5693,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "h100-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -4138,6 +5768,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -4249,8 +5880,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -4311,6 +5960,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "h100pool",
@@ -4391,8 +6041,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -4435,9 +6105,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "h100pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -4490,6 +6173,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "h100pool",
@@ -4584,8 +6268,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -4649,6 +6351,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -4706,8 +6409,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -4743,12 +6466,25 @@ COMPOSE_CASES = [
                                     "nodePools": [{"name": "system", "role": "System", "machineType": "e2-standard-4"}],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "l4-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2026-06-08T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
                                         },
                                     ],
                                     "cache": {"storageClassName": "modelplane-rwx"},
@@ -4794,6 +6530,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l4-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -4881,8 +6618,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -4930,6 +6685,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -4979,8 +6735,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -5031,6 +6807,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -5082,8 +6859,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -5123,9 +6920,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "l40s-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -5170,6 +6980,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -5232,8 +7043,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -5273,9 +7102,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "cpu-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -5316,6 +7158,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "cpu-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "cpu-pool",
@@ -5378,8 +7221,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -5430,6 +7291,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -5497,8 +7359,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -5553,6 +7435,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -5620,8 +7503,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -5658,9 +7561,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "l40s-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -5710,6 +7626,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "l40s-pool",
@@ -5790,8 +7707,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -5832,9 +7767,22 @@ COMPOSE_CASES = [
                                     ],
                                 },
                                 "status": {
+                                    "nodePools": [{"name": "h100-pool", "state": "Ready"}],
                                     "conditions": [
                                         {
                                             "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
                                             "status": "True",
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
@@ -5900,6 +7848,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -5979,8 +7928,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -6024,6 +7991,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -6087,8 +8055,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -6148,6 +8136,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Pending"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -6223,8 +8212,28 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Provisioning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
             ],
         ),
     ),
@@ -6273,7 +8282,20 @@ COMPOSE_CASES = [
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
                                         },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
                                     ],
+                                    "nodePools": [{"name": "h100-pool", "state": "Ready"}],
                                     "secrets": [
                                         {
                                             "type": "Kubeconfig",
@@ -6314,6 +8336,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "h100-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "h100-pool",
@@ -6390,8 +8413,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -6438,7 +8479,20 @@ COMPOSE_CASES = [
                                             "reason": "Available",
                                             "lastTransitionTime": "2024-01-01T00:00:00Z",
                                         },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
                                     ],
+                                    "nodePools": [{"name": "cpu-pool", "state": "Ready"}],
                                     "secrets": [
                                         {
                                             "type": "Kubeconfig",
@@ -6475,6 +8529,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=[{"name": "cpu-pool", "state": "Ready"}],
                     schedulable_pools=[
                         {
                             "name": "cpu-pool",
@@ -6548,8 +8603,726 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="UpCloudFirstPass",
+        reason="With no UpCloudCluster observed yet, an UpCloud cluster composes only the activation policy and the UpCloudCluster.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="UpCloud",
+                        upcloud=v1alpha1.Upcloud(
+                            zone="fi-hel2",
+                            autoscaler=v1alpha1.Autoscaler(secretRef=v1alpha1.SecretRefModel(name="upcloud-api")),
+                        ),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="l40s-pool", className="gpu-l40s-upcloud", nodeCount=2, maxNodeCount=4),
+                    ],
+                ),
+                resources={
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l40s-upcloud": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l40s-upcloud",
+                            count=1,
+                            memory="46068Mi",
+                            provisioning={
+                                "provider": "UpCloud",
+                                "upcloud": {
+                                    "plan": "GPU-8xCPU-64GB-1xL40S",
+                                    "accelerator": {"type": "nvidia-l40s", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l40s-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "46068Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l40s-upcloud": _input_usage(
+                        kind="InferenceClass", name="gpu-l40s-upcloud"
+                    ),
+                    "activation": _activation_policy(
+                        activate=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "upcloud-cluster": _upcloud_cluster(
+                        node_pools=[
+                            {
+                                "name": "l40s-pool",
+                                "role": "GPU",
+                                "plan": "GPU-8xCPU-64GB-1xL40S",
+                                "diskSizeGb": 100,
+                                "nodeCount": 2,
+                                "maxNodeCount": 4,
+                                "gpu": {"acceleratorType": "nvidia-l40s"},
+                            },
+                        ],
+                        credentials=None,
+                        autoscaler={"secretRef": {"name": "upcloud-api", "key": "token"}},
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l40s-upcloud": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l40s-upcloud"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="UpCloudCredentials",
+        reason="An UpCloud cluster's credentials pass through to the UpCloudCluster's spec.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="UpCloud",
+                        upcloud=v1alpha1.Upcloud(
+                            zone="fi-hel2",
+                            credentials=v1alpha1.Credentials(type="ProviderConfig", name="my-upcloud-account"),
+                            autoscaler=v1alpha1.Autoscaler(secretRef=v1alpha1.SecretRefModel(name="upcloud-api")),
+                        ),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="l40s-pool", className="gpu-l40s-upcloud", nodeCount=2, maxNodeCount=4),
+                    ],
+                ),
+                resources={
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l40s-upcloud": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l40s-upcloud",
+                            count=1,
+                            memory="46068Mi",
+                            provisioning={
+                                "provider": "UpCloud",
+                                "upcloud": {
+                                    "plan": "GPU-8xCPU-64GB-1xL40S",
+                                    "accelerator": {"type": "nvidia-l40s", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Pending"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l40s-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "46068Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l40s-upcloud": _input_usage(
+                        kind="InferenceClass", name="gpu-l40s-upcloud"
+                    ),
+                    "activation": _activation_policy(
+                        activate=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "upcloud-cluster": _upcloud_cluster(
+                        node_pools=[
+                            {
+                                "name": "l40s-pool",
+                                "role": "GPU",
+                                "plan": "GPU-8xCPU-64GB-1xL40S",
+                                "diskSizeGb": 100,
+                                "nodeCount": 2,
+                                "maxNodeCount": 4,
+                                "gpu": {"acceleratorType": "nvidia-l40s"},
+                            },
+                        ],
+                        credentials={"type": "ProviderConfig", "name": "my-upcloud-account"},
+                        autoscaler={"secretRef": {"name": "upcloud-api", "key": "token"}},
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l40s-upcloud": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l40s-upcloud"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for ClusterReady",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for NodePoolsReady",
+                ),
+            ],
+        ),
+    ),
+    # The UKS kubeconfig embeds static client certificates, so the
+    # ClusterProviderConfig carries no identity (unlike Nebius).
+    # UpCloudCluster reports no cache StorageClass, so status.cache stays
+    # unset.
+    ComposeCase(
+        name="UpCloudReady",
+        reason="Once its UpCloudCluster is Ready, an UpCloud cluster composes a ClusterProviderConfig without identity, the ServingStack and the Usage.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="UpCloud",
+                        upcloud=v1alpha1.Upcloud(
+                            zone="fi-hel2",
+                            autoscaler=v1alpha1.Autoscaler(secretRef=v1alpha1.SecretRefModel(name="upcloud-api")),
+                        ),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="l40s-pool", className="gpu-l40s-upcloud", nodeCount=2, maxNodeCount=4),
+                    ],
+                ),
+                resources={
+                    "upcloud-cluster": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "UpCloudCluster",
+                                "metadata": {"name": "test-cluster", "namespace": "modelplane-system"},
+                                "spec": {
+                                    "zone": "fi-hel2",
+                                    "nodePools": [
+                                        {
+                                            "name": "l40s-pool",
+                                            "role": "GPU",
+                                            "plan": "GPU-8xCPU-64GB-1xL40S",
+                                            "nodeCount": 2,
+                                        },
+                                    ],
+                                },
+                                "status": {
+                                    "conditions": [
+                                        {
+                                            "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                    ],
+                                    "nodePools": [{"name": "l40s-pool", "state": "Ready"}],
+                                    "secrets": [
+                                        {
+                                            "type": "Kubeconfig",
+                                            "name": "test-cluster-kubeconfig-abcde",
+                                            "key": "kubeconfig",
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l40s-upcloud": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l40s-upcloud",
+                            count=1,
+                            memory="46068Mi",
+                            provisioning={
+                                "provider": "UpCloud",
+                                "upcloud": {
+                                    "plan": "GPU-8xCPU-64GB-1xL40S",
+                                    "accelerator": {"type": "nvidia-l40s", "count": 1},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "l40s-pool", "state": "Ready"}],
+                    schedulable_pools=[
+                        {
+                            "name": "l40s-pool",
+                            "nodes": 4,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 1,
+                                    "capacity": {"memory": {"value": "46068Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-gpu-l40s-upcloud": _input_usage(
+                        kind="InferenceClass", name="gpu-l40s-upcloud"
+                    ),
+                    "activation": _activation_policy(
+                        activate=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "upcloud-cluster": _upcloud_cluster(
+                        node_pools=[
+                            {
+                                "name": "l40s-pool",
+                                "role": "GPU",
+                                "plan": "GPU-8xCPU-64GB-1xL40S",
+                                "diskSizeGb": 100,
+                                "nodeCount": 2,
+                                "maxNodeCount": 4,
+                                "gpu": {"acceleratorType": "nvidia-l40s"},
+                            },
+                        ],
+                        credentials=None,
+                        autoscaler={"secretRef": {"name": "upcloud-api", "key": "token"}},
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="test-cluster-kubeconfig-abcde", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="UpCloud",
+                        secrets=[{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        dra_drivers=("gpu.nvidia.com",),
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "usage-upcloud-by-backend": _backend_usage(cluster_kind="UpCloudCluster"),
+                },
+            ),
+            results=[fnv1.Result(severity=fnv1.SEVERITY_NORMAL, message="UpCloud cluster ready, composing backend")],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l40s-upcloud": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l40s-upcloud"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="UpCloudCPUPool",
+        reason="Once its UpCloudCluster is Ready, an UpCloud cluster whose pool's class names no accelerator composes a CPU-role pool, a ServingStack claiming dra.cpu and the Usage.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="UpCloud",
+                        upcloud=v1alpha1.Upcloud(zone="fi-hel2"),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="cpu-pool", className="cpu-upcloud", nodeCount=2),
+                    ],
+                ),
+                resources={
+                    "upcloud-cluster": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "UpCloudCluster",
+                                "metadata": {"name": "test-cluster", "namespace": "modelplane-system"},
+                                "spec": {
+                                    "zone": "fi-hel2",
+                                    "nodePools": [
+                                        {
+                                            "name": "cpu-pool",
+                                            "role": "CPU",
+                                            "plan": "PREMIUM-8xCPU-32GB",
+                                            "nodeCount": 2,
+                                        },
+                                    ],
+                                },
+                                "status": {
+                                    "conditions": [
+                                        {
+                                            "type": "Ready",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2024-01-01T00:00:00Z",
+                                        },
+                                    ],
+                                    "nodePools": [{"name": "cpu-pool", "state": "Ready"}],
+                                    "secrets": [
+                                        {
+                                            "type": "Kubeconfig",
+                                            "name": "test-cluster-kubeconfig-abcde",
+                                            "key": "kubeconfig",
+                                        },
+                                    ],
+                                },
+                            }
+                        ),
+                    ),
+                    "activation": _observed_activation_policy(
+                        activated=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ]
+                    ),
+                },
+            ),
+            required_resources={
+                "class-cpu-upcloud": fnv1.Resources(
+                    items=[
+                        _cpu_inference_class(
+                            name="cpu-upcloud",
+                            cpus="6",
+                            provisioning={
+                                "provider": "UpCloud",
+                                "upcloud": {"plan": "PREMIUM-8xCPU-32GB"},
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    node_pools=[{"name": "cpu-pool", "state": "Ready"}],
+                    schedulable_pools=[
+                        {
+                            "name": "cpu-pool",
+                            "nodes": 2,
+                            "devices": [
+                                {
+                                    "name": "cpu",
+                                    "claim": "DRA",
+                                    "driver": "dra.cpu",
+                                    "deviceClassName": "dra.cpu",
+                                    "count": 1,
+                                    "capacity": {"cpu": {"value": "6"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway=None,
+                ),
+                resources={
+                    "usage-inferenceclass-cpu-upcloud": _input_usage(kind="InferenceClass", name="cpu-upcloud"),
+                    "activation": _activation_policy(
+                        activate=[
+                            "kubernetesclusters.uks.m.upcloud.com",
+                            "kubernetesnodegroups.uks.m.upcloud.com",
+                            "networks.network.m.upcloud.com",
+                        ],
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "upcloud-cluster": _upcloud_cluster(
+                        node_pools=[
+                            {
+                                "name": "cpu-pool",
+                                "role": "CPU",
+                                "plan": "PREMIUM-8xCPU-32GB",
+                                "diskSizeGb": 100,
+                                "nodeCount": 2,
+                            },
+                        ],
+                        credentials=None,
+                        autoscaler=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="test-cluster-kubeconfig-abcde", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="UpCloud",
+                        secrets=[{"type": "Kubeconfig", "name": "test-cluster-kubeconfig-abcde", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        dra_drivers=("dra.cpu",),
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "usage-upcloud-by-backend": _backend_usage(cluster_kind="UpCloudCluster"),
+                },
+            ),
+            results=[fnv1.Result(severity=fnv1.SEVERITY_NORMAL, message="UpCloud cluster ready, composing backend")],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-cpu-upcloud": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="cpu-upcloud"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -6667,6 +9440,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -6729,8 +9503,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -6792,6 +9584,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -6849,8 +9642,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -6898,6 +9709,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -6955,8 +9767,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -7005,6 +9835,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -7061,8 +9892,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -7116,6 +9965,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[
                         {
                             "name": "l4-pool",
@@ -7171,8 +10021,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Provisioning",
+                ),
             ],
         ),
     ),
@@ -7181,7 +10049,7 @@ COMPOSE_CASES = [
     # missing from it.
     ComposeCase(
         name="ClassUnresolved",
-        reason="With its class unresolved, the function fails the reconcile, reporting the missing class on ClusterReady.",
+        reason="With its class unresolved, the function fails the reconcile, reporting the missing class on Accepted.",
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
                 composite=_inference_cluster(
@@ -7247,10 +10115,26 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="WaitingForClasses",
                     message="Waiting for InferenceClasses: gpu-l4",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Pending",
+                    message="Waiting for Accepted",
                 ),
             ],
         ),
@@ -7340,7 +10224,7 @@ COMPOSE_CASES = [
     # gate goes back to returning without a fatal result.
     ComposeCase(
         name="UnsupportedDriverHolds",
-        reason="A running cluster whose class turns unsupported gets a fatal result, so Crossplane holds its resources instead of collecting them.",
+        reason="A running cluster whose class turns unsupported gets a fatal result, so Crossplane holds its resources instead of collecting them, and its stages keep reporting the running cluster.",
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
                 composite=_inference_cluster(
@@ -7364,11 +10248,25 @@ COMPOSE_CASES = [
                                             "reason": "Available",
                                             "lastTransitionTime": "2026-06-08T00:00:00Z",
                                         },
+                                        {
+                                            "type": "ClusterReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2026-06-08T00:00:00Z",
+                                        },
+                                        {
+                                            "type": "NodePoolsReady",
+                                            "status": "True",
+                                            "reason": "Available",
+                                            "lastTransitionTime": "2026-06-08T00:00:00Z",
+                                        },
                                     ],
+                                    "nodePools": [{"name": "l4-pool", "state": "Ready"}],
                                 },
                             }
                         ),
                     ),
+                    "serving-stack": _observed_serving_stack(gateway={"address": "34.55.100.10"}),
                 },
             ),
             required_resources={
@@ -7442,10 +10340,25 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(
-                    type="ClusterReady",
+                    type="Accepted",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="UnsupportedDevices",
                     message="class gpu-l4 claims gpu.amd.com; GKE clusters support dra.cpu, gpu.nvidia.com",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
                 ),
             ],
         ),
@@ -7492,6 +10405,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[],
                     cache=None,
                     gateway={
@@ -7533,8 +10447,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -7566,7 +10498,10 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
-                    schedulable_pools=[], cache=None, gateway={"address": "34.55.100.10", "caCertificate": "cluster-ca"}
+                    node_pools=None,
+                    schedulable_pools=[],
+                    cache=None,
+                    gateway={"address": "34.55.100.10", "caCertificate": "cluster-ca"},
                 ),
                 resources={
                     "cluster-provider-config-kubernetes": _cluster_provider_config(
@@ -7600,8 +10535,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -7638,7 +10591,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
-                    schedulable_pools=[], cache=None, gateway={"address": "34.55.100.10"}
+                    node_pools=None, schedulable_pools=[], cache=None, gateway={"address": "34.55.100.10"}
                 ),
                 resources={
                     "usage-replicas": _guard_cluster_usage(reason="InferenceGateways use this InferenceCluster"),
@@ -7673,8 +10626,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -7709,7 +10680,7 @@ COMPOSE_CASES = [
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
-                composite=_desired_inference_cluster(schedulable_pools=[], cache=None, gateway=None),
+                composite=_desired_inference_cluster(schedulable_pools=[], node_pools=None, cache=None, gateway=None),
                 resources={
                     "usage-replicas": _guard_cluster_usage(reason="InferenceGateways use this InferenceCluster"),
                     "cluster-provider-config-kubernetes": _cluster_provider_config(
@@ -7743,8 +10714,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -7789,6 +10778,7 @@ COMPOSE_CASES = [
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=_desired_inference_cluster(
+                    node_pools=None,
                     schedulable_pools=[],
                     cache=None,
                     gateway={
@@ -7834,8 +10824,26 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
-                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+                fnv1.Condition(
+                    type="Accepted",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
+                fnv1.Condition(
+                    type="ClusterReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="NodePoolsReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Existing",
+                ),
+                fnv1.Condition(
+                    type="ServingStackReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="Available",
+                ),
             ],
         ),
     ),
@@ -7934,7 +10942,7 @@ def test_dra_drivers_synthetic() -> None:
 
 
 def test_unsupported_devices() -> None:
-    """Classes claiming drivers their cloud can't serve gate ClusterReady
+    """Classes claiming drivers their cloud can't serve gate Accepted
     with UnsupportedDevices, naming every offending class, and stop with
     a fatal result so a running cluster holds its existing resources
     rather than being garbage-collected."""
@@ -7954,9 +10962,9 @@ def test_unsupported_devices() -> None:
     )
     assert composer.check_devices_supported("Vultr") is False
     conditions = {c.type: c for c in composer.rsp.conditions}
-    assert conditions["ClusterReady"].status == fnv1.STATUS_CONDITION_FALSE
-    assert conditions["ClusterReady"].reason == "UnsupportedDevices"
-    assert conditions["ClusterReady"].message == (
+    assert conditions["Accepted"].status == fnv1.STATUS_CONDITION_FALSE
+    assert conditions["Accepted"].reason == "UnsupportedDevices"
+    assert conditions["Accepted"].message == (
         "class amd-mi355x-8x claims gpu.amd.com; class efa claims dra.net; "
         "Vultr clusters support dra.cpu, gpu.nvidia.com"
     )
