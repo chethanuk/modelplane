@@ -28,6 +28,8 @@ authorised on the cluster. Downstream consumers only need the kubeconfig;
 no per-cluster AWS identity has to be wired into provider-kubernetes.
 """
 
+import functools
+import ipaddress
 from typing import Literal
 
 import grpc
@@ -140,6 +142,11 @@ _LABEL_AZ = "modelplane.ai/zone"
 _LABEL_TIER = "modelplane.ai/subnet-tier"
 _TIER_PUBLIC = "public"
 _TIER_PRIVATE = "private"
+
+# Tags the subnetCidrs subnets, the ones the EKS control plane is placed in. A
+# private subnet composed for a pool zone outside subnetCidrs doesn't get it:
+# that zone may not support the control plane, which would fail cluster creation.
+_LABEL_CONTROL_PLANE = "modelplane.ai/control-plane"
 
 # EKS discovers which subnets to place internet-facing load balancers in by this
 # tag. Nodes run in private subnets, so the serving gateway's ELB would have no
@@ -330,6 +337,37 @@ _ANNOTATION_EXTERNAL_NAME = "crossplane.io/external-name"
 # point per PVC inside the auto-provisioned filesystem.
 _MANAGED_STORAGE_CLASS = "modelplane-rwx-efs"
 
+# Conditions reporting which provisioning stage the cluster is in. The cluster
+# is everything this XR composes except the user's node pools: network, IAM,
+# control plane, system node group and add-ons. compose-inference-cluster
+# relays both conditions onto the InferenceCluster.
+CONDITION_TYPE_CLUSTER_READY = "ClusterReady"
+CONDITION_TYPE_NODE_POOLS_READY = "NodePoolsReady"
+
+CONDITION_REASON_AVAILABLE = "Available"
+CONDITION_REASON_PENDING = "Pending"
+CONDITION_REASON_PROVISIONING = "Provisioning"
+CONDITION_REASON_FAILED = "Failed"
+
+# status.nodePools[].state values.
+_POOL_STATE_PENDING = "Pending"
+_POOL_STATE_PROVISIONING = "Provisioning"
+_POOL_STATE_READY = "Ready"
+_POOL_STATE_FAILED = "Failed"
+
+# upjet sets this condition False, with the provider's error as its message,
+# when its last create, update or delete of the external resource failed. It's
+# the only failure signal read: a managed resource is also Synced=False while it
+# waits for a reference to resolve, which is routine during provisioning.
+_CONDITION_LAST_ASYNC_OPERATION = "LastAsyncOperation"
+
+
+def _first(failures: list[str]) -> str:
+    """The first failure, noting how many more there are."""
+    if len(failures) == 1:
+        return failures[0]
+    return f"{failures[0]} (and {len(failures) - 1} more)"
+
 
 def _kubeconfig_secret_name(xr: v1alpha1.EKSCluster) -> str:
     """Derive the kubeconfig secret name from the XR."""
@@ -434,8 +472,10 @@ class Composer:
         self.compose_efa_dra_driver()
         self.compose_provider_configs()
         self.compose_storage_class()
-        self.write_status()
         self.mark_readiness()
+        node_pools = self.node_pool_statuses()
+        self.derive_conditions(node_pools)
+        self.write_status(node_pools)
 
     def compose_network(self) -> None:
         """Compose the VPC, its two subnet tiers, and internet routing.
@@ -476,7 +516,7 @@ class Composer:
                 subnetv1beta1.Subnet(
                     metadata=metav1.ObjectMeta(
                         name=_subnet_name(self.xr, az),
-                        labels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PUBLIC},
+                        labels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PUBLIC, _LABEL_CONTROL_PLANE: "true"},
                     ),
                     spec=subnetv1beta1.Spec(
                         providerConfigRef=subnetv1beta1.ProviderConfigRef(
@@ -502,7 +542,7 @@ class Composer:
                 subnetv1beta1.Subnet(
                     metadata=metav1.ObjectMeta(
                         name=_private_subnet_name(self.xr, az),
-                        labels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PRIVATE},
+                        labels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PRIVATE, _LABEL_CONTROL_PLANE: "true"},
                     ),
                     spec=subnetv1beta1.Spec(
                         providerConfigRef=subnetv1beta1.ProviderConfigRef(
@@ -513,6 +553,34 @@ class Composer:
                             region=self.xr.spec.region,
                             availabilityZone=az,
                             cidrBlock=_private_cidr(cidr),
+                            mapPublicIpOnLaunch=False,
+                            vpcIdSelector=subnetv1beta1.VpcIdSelector(
+                                matchControllerRef=True,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        # Private subnets for pool zones beyond the index-derived AZs above, keyed
+        # by AZ name so adding one never renames or re-CIDRs an existing subnet.
+        for az, cidr in self._extra_private_cidrs.items():
+            resource.update(
+                self.rsp.desired.resources[f"private-subnet-{az}"],
+                subnetv1beta1.Subnet(
+                    metadata=metav1.ObjectMeta(
+                        name=_private_subnet_name(self.xr, az),
+                        labels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PRIVATE},
+                    ),
+                    spec=subnetv1beta1.Spec(
+                        providerConfigRef=subnetv1beta1.ProviderConfigRef(
+                            kind=self._cred_kind(),
+                            name=self._cred_name(),
+                        ),
+                        forProvider=subnetv1beta1.ForProvider(
+                            region=self.xr.spec.region,
+                            availabilityZone=az,
+                            cidrBlock=cidr,
                             mapPublicIpOnLaunch=False,
                             vpcIdSelector=subnetv1beta1.VpcIdSelector(
                                 matchControllerRef=True,
@@ -712,6 +780,30 @@ class Composer:
                 ),
             )
 
+        for az in self._extra_private_cidrs:
+            resource.update(
+                self.rsp.desired.resources[f"private-route-table-association-{az}"],
+                rtav1beta1.RouteTableAssociation(
+                    spec=rtav1beta1.Spec(
+                        providerConfigRef=rtav1beta1.ProviderConfigRef(
+                            kind=self._cred_kind(),
+                            name=self._cred_name(),
+                        ),
+                        forProvider=rtav1beta1.ForProvider(
+                            region=self.xr.spec.region,
+                            routeTableIdSelector=rtav1beta1.RouteTableIdSelector(
+                                matchControllerRef=True,
+                                matchLabels={_LABEL_TIER: _TIER_PRIVATE},
+                            ),
+                            subnetIdSelector=rtav1beta1.SubnetIdSelector(
+                                matchControllerRef=True,
+                                matchLabels={_LABEL_AZ: az, _LABEL_TIER: _TIER_PRIVATE},
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
     def compose_iam(self) -> None:
         """Compose the cluster and node IAM roles."""
         resource.update(
@@ -816,6 +908,7 @@ class Composer:
                             endpointPublicAccess=True,
                             subnetIdSelector=clusterv1beta1.SubnetIdSelector(
                                 matchControllerRef=True,
+                                matchLabels={_LABEL_CONTROL_PLANE: "true"},
                             ),
                         ),
                     ),
@@ -1331,10 +1424,11 @@ class Composer:
         )
 
         # One mount target per node subnet so any AZ's nodes can mount the share.
-        for i in range(len(self._networking().subnetCidrs or [])):
-            az = _az(region, i)
+        mount_azs = [(str(i), _az(region, i)) for i in range(len(self._networking().subnetCidrs or []))]
+        mount_azs += [(az, az) for az in self._extra_private_cidrs]
+        for key, az in mount_azs:
             resource.update(
-                self.rsp.desired.resources[f"efs-mount-target-{i}"],
+                self.rsp.desired.resources[f"efs-mount-target-{key}"],
                 mtv1beta1.MountTarget(
                     spec=mtv1beta1.Spec(
                         providerConfigRef=mtv1beta1.ProviderConfigRef(
@@ -1700,8 +1794,9 @@ class Composer:
             ),
         )
 
-    def write_status(self) -> None:
+    def write_status(self, node_pools: list[v1alpha1.NodePoolModel]) -> None:
         status = v1alpha1.Status(
+            nodePools=node_pools,
             secrets=[
                 v1alpha1.Secret(
                     type=_SECRET_TYPE_KUBECONFIG,
@@ -1767,6 +1862,10 @@ class Composer:
             managed_resources.append(f"route-table-association-{i}")
             managed_resources.append(f"private-route-table-association-{i}")
             managed_resources.append(f"efs-mount-target-{i}")
+        for az in self._extra_private_cidrs:
+            managed_resources.append(f"private-subnet-{az}")
+            managed_resources.append(f"private-route-table-association-{az}")
+            managed_resources.append(f"efs-mount-target-{az}")
         managed_resources += [f"nodegroup-{p.name}" for p in self.xr.spec.nodePools]
         managed_resources += [
             f"launch-template-{p.name}"
@@ -1796,6 +1895,152 @@ class Composer:
         self.rsp.desired.resources["provider-config-kubernetes"].ready = fnv1.READY_TRUE
         self.rsp.desired.resources["provider-config-helm"].ready = fnv1.READY_TRUE
 
+    def pool_resources(self, pool: v1alpha1.NodePool) -> list[str]:
+        """The composed resources that build pool. The EFA security group is
+        shared by every EFA pool, so it's part of the cluster instead."""
+        resources = [f"nodegroup-{pool.name}"]
+        if pool.capacityReservation or pool.fabric == _FABRIC_EFA:
+            resources.append(f"launch-template-{pool.name}")
+        return resources
+
+    def _failures(self, resources: list[str]) -> list[str]:
+        """Each composed resource whose provider reports its last operation
+        failed, as its name and the provider's error."""
+        failures = []
+        for r in resources:
+            c = resource.get_condition(self.req.observed.resources.get(r), _CONDITION_LAST_ASYNC_OPERATION)
+            if c.status == "False":
+                failures.append(f"{r}: {c.message}")
+        return failures
+
+    def _unready(self, resources: list[str]) -> list[str]:
+        """Each of resources that isn't composed and marked ready."""
+        desired = self.rsp.desired.resources
+        return [r for r in resources if r not in desired or desired[r].ready != fnv1.READY_TRUE]
+
+    def _stage_pools(self) -> list[v1alpha1.NodePool]:
+        """The node pools NodePoolsReady and status.nodePools report. A System
+        pool runs the cluster's controllers and serving stack, so it's part of
+        ClusterReady."""
+        return [pool for pool in self.xr.spec.nodePools if pool.role != "System"]
+
+    def node_pool_statuses(self) -> list[v1alpha1.NodePoolModel]:
+        """The provisioning state of each node pool, from its resources."""
+        statuses = []
+        for pool in self._stage_pools():
+            resources = self.pool_resources(pool)
+            failures = self._failures(resources)
+            if failures:
+                statuses.append(
+                    v1alpha1.NodePoolModel(name=pool.name, state=_POOL_STATE_FAILED, message=_first(failures))
+                )
+            elif not any(r in self.rsp.desired.resources for r in resources):
+                statuses.append(v1alpha1.NodePoolModel(name=pool.name, state=_POOL_STATE_PENDING))
+            elif self._unready(resources):
+                statuses.append(v1alpha1.NodePoolModel(name=pool.name, state=_POOL_STATE_PROVISIONING))
+            else:
+                statuses.append(v1alpha1.NodePoolModel(name=pool.name, state=_POOL_STATE_READY))
+        return statuses
+
+    def derive_conditions(self, node_pools: list[v1alpha1.NodePoolModel]) -> None:
+        """Derive ClusterReady from the readiness mark_readiness set, and
+        NodePoolsReady from node_pools.
+
+        NodePoolsReady waits on ClusterReady only while no pool is Ready, so on
+        a running cluster the pools report their own state while the cluster
+        or a new pool provisions. A failed pool is reported Failed even while
+        the cluster is still provisioning.
+        """
+        in_pools = {r for pool in self._stage_pools() for r in self.pool_resources(pool)}
+        cluster = sorted(r for r in self.rsp.desired.resources if r not in in_pools)
+        failures = self._failures(cluster)
+        unready = self._unready(cluster)
+        if failures:
+            cluster_ready = resource.Condition(
+                typ=CONDITION_TYPE_CLUSTER_READY,
+                status="False",
+                reason=CONDITION_REASON_FAILED,
+                message=_first(failures),
+            )
+        elif unready:
+            cluster_ready = resource.Condition(
+                typ=CONDITION_TYPE_CLUSTER_READY,
+                status="False",
+                reason=CONDITION_REASON_PROVISIONING,
+                message=f"{len(cluster) - len(unready)} of {len(cluster)} resources ready",
+            )
+        else:
+            cluster_ready = resource.Condition(
+                typ=CONDITION_TYPE_CLUSTER_READY, status="True", reason=CONDITION_REASON_AVAILABLE
+            )
+
+        failed = [p.name for p in node_pools if p.state == _POOL_STATE_FAILED]
+        ready = [p.name for p in node_pools if p.state == _POOL_STATE_READY]
+        if failed:
+            pools_ready = resource.Condition(
+                typ=CONDITION_TYPE_NODE_POOLS_READY,
+                status="False",
+                reason=CONDITION_REASON_FAILED,
+                message=f"{len(failed)} of {len(node_pools)} node pools failed: {', '.join(failed)}",
+            )
+        elif cluster_ready.status != "True" and not ready:
+            pools_ready = resource.Condition(
+                typ=CONDITION_TYPE_NODE_POOLS_READY,
+                status="False",
+                reason=CONDITION_REASON_PENDING,
+                message=f"Waiting for {CONDITION_TYPE_CLUSTER_READY}",
+            )
+        elif len(ready) < len(node_pools):
+            pools_ready = resource.Condition(
+                typ=CONDITION_TYPE_NODE_POOLS_READY,
+                status="False",
+                reason=CONDITION_REASON_PROVISIONING,
+                message=f"{len(ready)} of {len(node_pools)} node pools ready",
+            )
+        else:
+            pools_ready = resource.Condition(
+                typ=CONDITION_TYPE_NODE_POOLS_READY, status="True", reason=CONDITION_REASON_AVAILABLE
+            )
+        response.set_conditions(self.rsp, cluster_ready, pools_ready)
+
     def _networking(self) -> v1alpha1.Networking:
         """Return the (defaulted) networking config from the XR."""
         return self.xr.spec.networking or v1alpha1.Networking()
+
+    @functools.cached_property
+    def _extra_private_cidrs(self) -> dict[str, str]:
+        """Return a private subnet CIDR for each pool zone the subnetCidrs miss.
+
+        subnetCidrs only covers the region's first len(subnetCidrs) AZs, but a
+        pool may need another (e.g. us-east-1d when 1a-1c are out of capacity).
+        Each such zone gets a private subnet in a free slot of the VPC, the same
+        size as the first subnet in subnetCidrs. The slot is picked by the
+        zone's letter, so it doesn't move when other zones come and go. It does
+        depend on subnetCidrs, so changing subnetCidrs can move it. Zones that don't look
+        like <region><letter>, or that don't fit in the VPC, get a warning.
+        """
+        region = self.xr.spec.region
+        cidrs = [c.root if hasattr(c, "root") else c for c in self._networking().subnetCidrs or []]
+        covered = {_az(region, i) for i in range(len(cidrs))}
+        zones = sorted(
+            {z.root if hasattr(z, "root") else z for p in self.xr.spec.nodePools for z in p.zones or []} - covered
+        )
+        if not zones:
+            return {}
+        try:
+            used = [ipaddress.ip_network(c, strict=False) for c in cidrs + [_private_cidr(c) for c in cidrs]]
+            vpc = ipaddress.ip_network(str(self._networking().vpcCidr), strict=False)
+            free = [s for s in vpc.subnets(new_prefix=used[0].prefixlen) if not any(s.overlaps(u) for u in used)]
+        except ValueError as e:
+            # e.g. a VPC smaller than its subnets; AWS rejects that anyway.
+            response.warning(self.rsp, f"Cannot compose private subnets for zones {', '.join(zones)}: {e}")
+            return {}
+        extra = {}
+        for z in zones:
+            letter = z.removeprefix(region)
+            slot = ord(letter) - ord("a") - len(cidrs) if len(letter) == 1 and "a" <= letter <= "z" else -1
+            if 0 <= slot < len(free):
+                extra[z] = str(free[slot])
+            else:
+                response.warning(self.rsp, f"Cannot compose a private subnet for zone {z} in VPC {vpc}")
+        return extra
