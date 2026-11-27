@@ -133,12 +133,15 @@ PUBLISHED_CASES = [
         file="sglang-v0.5.12.post1.json",
         want=["sglang:num_retracted_requests_total"],
     ),
+    # The picker's error counter is a labelled counter, which the Prometheus Go
+    # client writes only once it has a value, and the scrape's pod failed no
+    # request, so the scrape lacks it.
     PublishedCase(
         name="Picker",
-        reason="The llm-d endpoint picker v0.9.0 publishes every name the picker mapping reads.",
+        reason="The llm-d endpoint picker v0.9.0 publishes every name the picker mapping reads but its error counter.",
         mapping="modelplane-picker",
         file="picker-v0.9.0.json",
-        want=[],
+        want=["llm_d_epp_request_error_total"],
     ),
     PublishedCase(
         name="GKEDCGM",
